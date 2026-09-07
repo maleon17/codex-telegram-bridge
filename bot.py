@@ -187,6 +187,40 @@ def default_codex_home():
     return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 
 
+def _ensure_tenant_mcp_config(tenant_dir, chat_id):
+    config_path = tenant_dir / "config.toml"
+    section_header = "[mcp_servers.delegate-to-claude]"
+    try:
+        config_text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        config_text = ""
+    if any(
+        line.partition("#")[0].strip() == section_header
+        for line in config_text.splitlines()
+    ):
+        return
+
+    server_path = Path(__file__).with_name("delegate_to_claude_mcp.py").resolve()
+    result = subprocess.run(
+        [
+            "codex", "mcp", "add", "delegate-to-claude",
+            "--env", f"CHAT_ID={int(chat_id)}",
+            "--", sys.executable, str(server_path),
+        ],
+        env={**os.environ, "CODEX_HOME": str(tenant_dir)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "Could not seed delegate-to-claude MCP server: "
+            + (detail or f"codex exited with status {result.returncode}")
+        )
+
+
 def tenant_codex_home(chat_id, state_key=None):
     """Return a tenant home; delegates share auth/config, not session files."""
     chat_id = int(chat_id)
@@ -216,6 +250,14 @@ def tenant_codex_home(chat_id, state_key=None):
     if not agents_path.exists():
         shutil.copyfile(Path(__file__).with_name("personality.example.md"), agents_path)
         shutil.copyfile(Path(__file__).with_name("HANDOFF.md"), path / "handoff.md")
+    try:
+        _ensure_tenant_mcp_config(path, chat_id)
+    except Exception as exc:
+        # Cross-delegation is a nice-to-have on top of an otherwise-working
+        # tenant; a seeding hiccup (PATH, transient codex-cli failure, a
+        # concurrent seed race) must never break this tenant's ordinary
+        # chat, which is what calling tenant_codex_home() usually means.
+        log(f"tenant={chat_id} could not seed delegate-to-claude MCP server: {exc}")
     return path
 
 
