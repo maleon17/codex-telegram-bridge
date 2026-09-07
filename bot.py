@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -209,6 +210,10 @@ def tenant_codex_home(chat_id, state_key=None):
         return None
     path = ACCOUNTS_DIR / str(chat_id)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    agents_path = path / "AGENTS.md"
+    if not agents_path.exists():
+        shutil.copyfile(Path(__file__).with_name("personality.example.md"), agents_path)
+        shutil.copyfile(Path(__file__).with_name("HANDOFF.md"), path / "handoff.md")
     return path
 
 
@@ -1208,10 +1213,17 @@ def handle_app_notification(runtime, method, params):
         return
     if method == "account/login/completed":
         success = bool(params.get("success"))
-        update_state(runtime.state_key, account_status="ready" if success else "login_failed")
-        if success:
+        if success and runtime.chat_id != OWNER_ID:
+            update_state(runtime.state_key, account_status="awaiting_display_name")
+            send_plain(
+                runtime.chat_id,
+                "✅ Вход в аккаунт Codex завершён.\n\nКак к тебе обращаться?",
+            )
+        elif success:
+            update_state(runtime.state_key, account_status="ready")
             send_plain(runtime.chat_id, "✅ Вход в аккаунт Codex завершён.")
         else:
+            update_state(runtime.state_key, account_status="login_failed")
             send_plain(runtime.chat_id, f"❌ Вход не завершён: {params.get('error') or 'неизвестная ошибка'}")
         return
     with process_lock:
@@ -2473,9 +2485,22 @@ def handle_message(message):
         return
     runtime = active_delegate_tenant(chat_id) or owner_runtime
     account_status = chat_state(runtime.state_key).get("account_status")
-    if chat_id != OWNER_ID and account_status != "ready" and not account_is_ready(runtime):
+    if (chat_id != OWNER_ID and account_status != "ready"
+            and (account_status == "awaiting_display_name" or not account_is_ready(runtime))):
         if account_status == "awaiting_login":
             send_plain(chat_id, "Сначала заверши вход в Codex по ранее выданной ссылке.")
+        elif account_status == "awaiting_display_name":
+            tenant_dir = tenant_codex_home(chat_id)
+            if tenant_dir is not None:
+                agents_path = tenant_dir / "AGENTS.md"
+                try:
+                    personality = agents_path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    pass
+                else:
+                    agents_path.write_text(personality.replace("<user>", text), encoding="utf-8")
+            update_state(runtime.state_key, account_status="ready")
+            send_plain(chat_id, "✅ Запомнил, как к тебе обращаться.")
         else:
             threading.Thread(target=start_account_login, args=(runtime,), daemon=True).start()
         return

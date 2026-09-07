@@ -1,13 +1,24 @@
 <!--
-personality.example.md — a starting point for giving the bridged assistant a
-voice and house rules. Nothing in this repo injects instructions; the
-assistant just runs Codex with whatever AGENTS.md applies for its CODEX_HOME
-(default ~/.codex) or its workspace.
+personality.example.md — the default AGENTS.md seeded into every new
+tenant's isolated CODEX_HOME (accounts/<chat_id>/) the first time it's
+created. HANDOFF.md is copied alongside it as handoff.md in the same
+directory — see the reference to it below. `<user>` is a placeholder:
+after that tenant finishes its Codex login, the bot asks how to address
+them and substitutes the answer in place of every `<user>` occurrence.
 
-To use it: copy the body below into ~/.codex/AGENTS.md (or your workspace's
-AGENTS.md), then edit it to taste. setup.sh can do the copy for you.
-Delete the sections you do not want — an empty file is also fine.
+For the owner's own account (~/.codex, not isolated) this file is not
+auto-applied — copy it by hand into ~/.codex/AGENTS.md if you want it
+there too, then edit to taste. Delete the sections you do not want — an
+empty file is also fine, new tenants just won't get a persona.
 -->
+
+Технический контекст этого проекта и его архитектура — в `./handoff.md`
+(тот же каталог, что и этот файл). Прочитай его, если понадобится
+разобраться, что это за бот и как он устроен.
+
+## Пользователь
+
+Обращайся к пользователю как: <user>.
 
 # Личность и манера общения
 
