@@ -82,6 +82,8 @@ ACCOUNTS_DIR = Path(os.environ.get(
 EXTERNAL_REQUEST_FILE = Path(os.environ.get(
     "CODEX_BOT_EXTERNAL_REQUEST_FILE", Path(__file__).with_name("external_request.json")
 )).expanduser()
+CROSS_DELEGATE_QUEUE_DIR = Path(__file__).with_name("cross_delegate_queue")
+CROSS_DELEGATE_RESULT_DIR = Path(__file__).with_name("cross_delegate_result")
 
 state_lock = threading.RLock()
 process_lock = threading.RLock()
@@ -1904,6 +1906,98 @@ def external_request_watcher():
         )
 
 
+def _write_cross_delegate_result(request_id, ok, text):
+    CROSS_DELEGATE_RESULT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    result_path = CROSS_DELEGATE_RESULT_DIR / f"{request_id}.json"
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{request_id}.", suffix=".tmp", dir=CROSS_DELEGATE_RESULT_DIR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"done": True, "ok": bool(ok), "text": text},
+                handle,
+                ensure_ascii=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, result_path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def cross_delegate_watcher():
+    """Accept per-user Claude-to-Codex requests from the dedicated queue."""
+    CROSS_DELEGATE_QUEUE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    CROSS_DELEGATE_RESULT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    while True:
+        time.sleep(0.5)
+        for request_path in sorted(CROSS_DELEGATE_QUEUE_DIR.glob("*.json")):
+            request_id = request_path.stem
+            try:
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                log(f"Could not read cross-delegate request {request_id}: {exc}")
+                request = None
+            try:
+                request_path.unlink()
+            except FileNotFoundError:
+                pass
+
+            ok = False
+            if not isinstance(request, dict):
+                result_text = "Отклонено: повреждённый формат запроса делегации."
+            else:
+                chat_id = request.get("chat_id")
+                text = request.get("text")
+                if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+                    result_text = "Отклонено: некорректный Telegram chat_id."
+                elif not isinstance(text, str) or not text.strip():
+                    result_text = "Отклонено: пустой текст задачи."
+                elif str(chat_id) not in load_whitelist():
+                    result_text = (
+                        "Отклонено: этот Telegram ID отсутствует в whitelist Codex-бота."
+                    )
+                else:
+                    with state_lock:
+                        account = state_db.get("chats", {}).get(str(chat_id), {})
+                        account_status = (
+                            account.get("account_status") if isinstance(account, dict) else None
+                        )
+                    if account_status != "ready":
+                        result_text = (
+                            "Отклонено: Codex-аккаунт для этого Telegram ID не готов. "
+                            "Сначала заверши /login в Codex-боте."
+                        )
+                    else:
+                        ok = start_delegate_turn(chat_id, text)
+                        if ok:
+                            result_text = (
+                                "Принято: Codex-бот запустил задачу. Результат придёт "
+                                "в этот же Telegram-чат от Codex-бота."
+                            )
+                        else:
+                            runtime = get_delegate_tenant(chat_id)
+                            with process_lock:
+                                busy = runtime.busy or bool(runtime.pending_batch)
+                            result_text = (
+                                "Отклонено: уже выполняется предыдущая делегированная задача."
+                                if busy else
+                                "Отклонено: Codex-бот не смог запустить делегированную задачу."
+                            )
+            try:
+                _write_cross_delegate_result(request_id, ok, result_text)
+            except Exception as exc:
+                log(f"Could not write cross-delegate result {request_id}: {exc}")
+
+
 def stop_current_process(runtime):
     with process_lock:
         client = runtime.app_server
@@ -2547,6 +2641,7 @@ def main():
         log(f"Codex app-server warm start failed; will retry on first message: {exc}")
     threading.Thread(target=restart_watcher, daemon=True).start()
     threading.Thread(target=external_request_watcher, daemon=True).start()
+    threading.Thread(target=cross_delegate_watcher, daemon=True).start()
     log(f"Codex Telegram bot started; owner={OWNER_ID}, cwd={CODEX_CWD}")
     while True:
         params = {"timeout": 30, "allowed_updates": ["message"]}

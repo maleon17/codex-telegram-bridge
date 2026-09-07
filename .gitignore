@@ -5,6 +5,8 @@ restart.request
 last_turn_*.json
 external_request.json
 external_request.json.delegate.lock
+cross_delegate_queue/
+cross_delegate_result/
 accounts/
 whitelist.txt
 .env

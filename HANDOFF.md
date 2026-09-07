@@ -36,6 +36,15 @@ feeds straight into its own message queue, so one assistant can delegate a task
 to Codex without a Telegram round-trip. The bot is the consumer side; the
 producer side lives in the Claude bridge repo. Optional.
 
+Non-owner Claude tenants use a separate per-request channel, not
+`external_request.json`: their MCP server atomically writes
+`cross_delegate_queue/<uuid>.json`, and this bot writes the immediate
+accept/reject status to the matching file in `cross_delegate_result/`. Before
+starting the existing isolated delegate runtime, the consumer independently
+requires the request's Telegram id to be in this bot's current whitelist and
+its local `account_status` to be `ready`. The eventual Codex answer is delivered
+by Telegram to that same id.
+
 ## Topology
 
 - One systemd service runs `bot.py`. Pure standard library, no pip deps.
