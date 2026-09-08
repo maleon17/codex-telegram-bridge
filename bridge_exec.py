@@ -134,7 +134,36 @@ def main():
         sys.exit(1)
 
     env = load_dotenv()
-    chat_id = args.chat_id or int(env.get("OWNER_ID") or os.environ.get("OWNER_ID") or DEFAULT_OWNER_ID)
+    real_owner_id = int(env.get("OWNER_ID") or os.environ.get("OWNER_ID") or DEFAULT_OWNER_ID)
+    chat_id = args.chat_id or real_owner_id
+
+    # bridge_exec.py is an owner-only tool -- but any tenant's Claude/Codex
+    # bash tool can technically execve this script directly (full shell
+    # access is the accepted risk model, see CLAUDE.md). CHAT_ID is the one
+    # signal that reliably says who is *actually* running this process: the
+    # owner's own tenant shell (this session included) always has
+    # CHAT_ID == real_owner_id or no CHAT_ID at all; any other tenant's
+    # shell inherits its own numeric CHAT_ID instead. If that's foreign,
+    # refuse outright rather than silently defaulting the request to the
+    # owner -- confirmed live 2026-09-08: a tenant's own Claude ran this
+    # script directly instead of the delegate_to_codex MCP tool, and it
+    # silently landed the tenant's task in the owner's own delegate slot.
+    inherited_chat_id = os.environ.get("CHAT_ID")
+    if inherited_chat_id is not None:
+        try:
+            inherited_chat_id = int(inherited_chat_id)
+        except ValueError:
+            inherited_chat_id = None
+        if inherited_chat_id is not None and inherited_chat_id != real_owner_id:
+            print(
+                f"Отказ: этот процесс унаследовал CHAT_ID={inherited_chat_id} из чужого "
+                "тенантского окружения, а не запущен напрямую владельцем. bridge_exec.py "
+                "предназначен только для владельца -- если нужно делегировать задачу "
+                "своему Codex-инстансу, используй тул delegate_to_codex, а не этот скрипт "
+                "напрямую.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     request_path = external_request_path()
     # One real chat has one stable delegate tenant. Serialize bridge_exec
