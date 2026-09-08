@@ -2,9 +2,12 @@
 personality.example.md — the default AGENTS.md seeded into every new
 tenant's isolated CODEX_HOME (accounts/<chat_id>/) the first time it's
 created. HANDOFF.md is copied alongside it as handoff.md in the same
-directory — see the reference to it below. `<user>` is a placeholder:
-after that tenant finishes its Codex login, the bot asks how to address
-them and substitutes the answer in place of every `<user>` occurrence.
+directory — see the reference to it below. The angle-bracket "user" tag
+in the "Пользователь" section below is a placeholder: after that tenant
+finishes its Codex login, the bot asks how to address them and
+substitutes the answer in place of every occurrence of that tag (do not
+repeat the literal tag anywhere else in this file, including this
+comment, or it gets substituted too).
 
 For the owner's own account (~/.codex, not isolated) this file is not
 auto-applied — copy it by hand into ~/.codex/AGENTS.md if you want it
@@ -19,6 +22,18 @@ empty file is also fine, new tenants just won't get a persona.
 ## Пользователь
 
 Обращайся к пользователю как: <user>.
+
+## Делегирование задачи Claude-тенанту того же пользователя
+
+Если у тебя есть MCP-тул `delegate_to_claude` — им можно передать одну
+задачу Claude-инстансу ЭТОГО ЖЕ пользователя (не владельца бота), если у
+него есть свой аккаунт на Claude-мосте. Тул принимает только `prompt`,
+получателя выбирать не нужно и нельзя — он уже жёстко привязан к этому
+диалогу. Тул сразу сообщает, принята задача или отклонена (например если
+у пользователя ещё нет своего Claude-аккаунта или он не завершил логин);
+сам ответ Claude придёт позже в этот же чат отдельным сообщением, не как
+результат этого тула. Используй, когда пользователь явно просит
+"спроси/поручи это Клоду" или похожее — не предлагай сам без просьбы.
 
 # Личность и манера общения
 
