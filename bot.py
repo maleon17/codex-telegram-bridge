@@ -2,6 +2,7 @@
 """Single-owner Telegram frontend for persistent Codex CLI conversations."""
 
 import json
+import mimetypes
 import os
 import shutil
 import signal
@@ -84,6 +85,10 @@ EXTERNAL_REQUEST_FILE = Path(os.environ.get(
 )).expanduser()
 CROSS_DELEGATE_QUEUE_DIR = Path(__file__).with_name("cross_delegate_queue")
 CROSS_DELEGATE_RESULT_DIR = Path(__file__).with_name("cross_delegate_result")
+FILE_SEND_QUEUE_DIR = Path(__file__).with_name("file_send_queue")
+FILE_SEND_RESULT_DIR = Path(__file__).with_name("file_send_result")
+FILE_SEND_MAX_BYTES = 50 * 1024 * 1024
+FILE_SEND_MAX_CAPTION_CHARS = 1024
 
 state_lock = threading.RLock()
 process_lock = threading.RLock()
@@ -93,6 +98,16 @@ restart_draining = False
 
 
 DELEGATE_KEY_PREFIX = "delegate:"
+FILE_SEND_AGENTS_MARKER = "## Отправка файлов в Telegram"
+FILE_SEND_AGENTS_SECTION = """
+## Отправка файлов в Telegram
+
+Чтобы отправить пользователю готовый документ, сначала создай или скопируй его
+в каталог из переменной `CODEX_TELEGRAM_OUTBOX`, затем вызови MCP-тул
+`send_telegram_file` с абсолютным путём к файлу и, при необходимости, `caption`.
+Не пытайся искать или использовать токен Telegram: этот тул отправляет файл
+только в текущий чат и не раскрывает секреты бота.
+""".strip()
 
 
 def delegate_key(chat_id):
@@ -187,9 +202,9 @@ def default_codex_home():
     return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 
 
-def _ensure_tenant_mcp_config(tenant_dir, chat_id):
+def _ensure_tenant_mcp_server(tenant_dir, chat_id, name, server_filename):
     config_path = tenant_dir / "config.toml"
-    section_header = "[mcp_servers.delegate-to-claude]"
+    section_header = f"[mcp_servers.{name}]"
     try:
         config_text = config_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -200,10 +215,10 @@ def _ensure_tenant_mcp_config(tenant_dir, chat_id):
     ):
         return
 
-    server_path = Path(__file__).with_name("delegate_to_claude_mcp.py").resolve()
+    server_path = Path(__file__).with_name(server_filename).resolve()
     result = subprocess.run(
         [
-            "codex", "mcp", "add", "delegate-to-claude",
+            "codex", "mcp", "add", name,
             "--env", f"CHAT_ID={int(chat_id)}",
             "--", sys.executable, str(server_path),
         ],
@@ -216,9 +231,38 @@ def _ensure_tenant_mcp_config(tenant_dir, chat_id):
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(
-            "Could not seed delegate-to-claude MCP server: "
+            f"Could not seed {name} MCP server: "
             + (detail or f"codex exited with status {result.returncode}")
         )
+
+
+def _ensure_tenant_mcp_config(tenant_dir, chat_id):
+    _ensure_tenant_mcp_server(
+        tenant_dir, chat_id, "delegate-to-claude", "delegate_to_claude_mcp.py",
+    )
+    _ensure_tenant_mcp_server(
+        tenant_dir, chat_id, "send-telegram-file", "send_telegram_file_mcp.py",
+    )
+
+
+def tenant_file_outbox(chat_id):
+    """Return the only directory whose files a tenant may send to Telegram."""
+    path = ACCOUNTS_DIR / str(int(chat_id)) / "outbox"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def _ensure_tenant_file_send_instructions(agents_path):
+    try:
+        content = agents_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    if FILE_SEND_AGENTS_MARKER in content:
+        return
+    agents_path.write_text(
+        content.rstrip() + "\n\n" + FILE_SEND_AGENTS_SECTION + "\n",
+        encoding="utf-8",
+    )
 
 
 def tenant_codex_home(chat_id, state_key=None):
@@ -250,6 +294,7 @@ def tenant_codex_home(chat_id, state_key=None):
     if not agents_path.exists():
         shutil.copyfile(Path(__file__).with_name("personality.example.md"), agents_path)
         shutil.copyfile(Path(__file__).with_name("HANDOFF.md"), path / "handoff.md")
+    _ensure_tenant_file_send_instructions(agents_path)
     try:
         _ensure_tenant_mcp_config(path, chat_id)
     except Exception as exc:
@@ -903,6 +948,155 @@ def send_rich(chat_id, markdown_text):
     return result
 
 
+def send_document(chat_id, path, caption=""):
+    """Upload one local document through the bridge-owned Telegram token."""
+    global rate_limit_until
+    source = Path(path)
+    size = source.stat().st_size
+    if size > FILE_SEND_MAX_BYTES:
+        return {
+            "ok": False,
+            "description": f"Файл больше лимита {FILE_SEND_MAX_BYTES} байт.",
+        }
+    with telegram_lock:
+        now = time.monotonic()
+        if now < rate_limit_until:
+            remaining = max(1, int(rate_limit_until - now + 0.999))
+            return {
+                "ok": False,
+                "error_code": 429,
+                "description": "locally suppressed during Telegram rate limit",
+                "parameters": {"retry_after": remaining},
+            }
+
+    boundary = f"----CodexTelegram{time.time_ns()}"
+    body = bytearray()
+    for key, value in (("chat_id", str(chat_id)), ("caption", caption[:FILE_SEND_MAX_CAPTION_CHARS])):
+        if not value:
+            continue
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+    filename = source.name.replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(
+        f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode()
+    )
+    body.extend(f"Content-Type: {mime}\r\n\r\n".encode())
+    with source.open("rb") as handle:
+        body.extend(handle.read())
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    request = urllib.request.Request(
+        f"{API_BASE}/sendDocument",
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            result = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            result = {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+    if not result.get("ok"):
+        if _rate_limited(result):
+            retry_after = (result.get("parameters") or {}).get("retry_after")
+            try:
+                delay = max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                delay = 1.0
+            with telegram_lock:
+                rate_limit_until = max(rate_limit_until, time.monotonic() + delay)
+        log(f"Telegram sendDocument not ok: {result}")
+    return result
+
+
+def _write_file_send_result(request_id, ok, text):
+    FILE_SEND_RESULT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = FILE_SEND_RESULT_DIR / f"{request_id}.json"
+    temporary = FILE_SEND_RESULT_DIR / f".{request_id}.{os.getpid()}.tmp"
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump({"done": True, "ok": bool(ok), "text": text}, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _file_in_tenant_outbox(chat_id, path):
+    try:
+        source = Path(path).resolve(strict=True)
+        source.relative_to(tenant_file_outbox(chat_id).resolve())
+    except (OSError, ValueError):
+        return None
+    return source if source.is_file() else None
+
+
+def process_file_send_queue():
+    """Send approved outbox files requested through tenant MCP processes."""
+    FILE_SEND_QUEUE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for request_path in sorted(FILE_SEND_QUEUE_DIR.glob("*.json")):
+        request_id = request_path.stem
+        try:
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            log(f"Could not read file-send request {request_id}: {exc}")
+            request = None
+        try:
+            request_path.unlink()
+        except FileNotFoundError:
+            pass
+
+        ok = False
+        if not isinstance(request, dict):
+            message = "Отклонено: повреждённый запрос отправки файла."
+        else:
+            chat_id = request.get("chat_id")
+            path = request.get("path")
+            caption = request.get("caption", "")
+            if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+                message = "Отклонено: некорректный Telegram chat_id."
+            elif str(chat_id) not in load_whitelist():
+                message = "Отклонено: Telegram ID отсутствует в whitelist."
+            elif not isinstance(path, str) or not isinstance(caption, str):
+                message = "Отклонено: некорректный путь или подпись."
+            elif len(caption) > FILE_SEND_MAX_CAPTION_CHARS:
+                message = "Отклонено: подпись длиннее лимита Telegram."
+            else:
+                source = _file_in_tenant_outbox(chat_id, path)
+                if source is None:
+                    message = "Отклонено: файл должен быть обычным файлом из CODEX_TELEGRAM_OUTBOX."
+                elif source.stat().st_size > FILE_SEND_MAX_BYTES:
+                    message = f"Отклонено: файл больше {FILE_SEND_MAX_BYTES} байт."
+                else:
+                    result = send_document(chat_id, source, caption)
+                    ok = bool(result.get("ok"))
+                    if ok:
+                        message = f"Файл «{source.name}» отправлен в Telegram."
+                    else:
+                        message = "Telegram не принял файл: " + compact(
+                            str(result.get("description") or result.get("error") or result), 500,
+                        )
+        try:
+            _write_file_send_result(request_id, ok, message)
+        except Exception as exc:
+            log(f"Could not write file-send result {request_id}: {exc}")
+
+
 def edit_rich(chat_id, message_id, markdown_text):
     text = markdown_text[:RICH_MAX_CHARS]
     params = {
@@ -1208,6 +1402,7 @@ def codex_process_env(runtime, extra_env=None):
     codex_home = tenant_codex_home(runtime.chat_id, state_key=runtime.state_key)
     if codex_home is not None:
         env["CODEX_HOME"] = str(codex_home)
+    env["CODEX_TELEGRAM_OUTBOX"] = str(tenant_file_outbox(runtime.chat_id))
     if extra_env:
         env.update(extra_env)
         if codex_home is not None:
@@ -2659,6 +2854,10 @@ def register_commands():
 def main():
     offset = None
     register_commands()
+    try:
+        _ensure_tenant_mcp_config(default_codex_home(), OWNER_ID)
+    except Exception as exc:
+        log(f"owner could not seed tenant MCP servers: {exc}")
     with state_lock:
         runtime_state = state_db.get("runtime", {})
         completed_restart_chat_id = runtime_state.get("restart_completed_chat_id")
@@ -2686,6 +2885,7 @@ def main():
     threading.Thread(target=cross_delegate_watcher, daemon=True).start()
     log(f"Codex Telegram bot started; owner={OWNER_ID}, cwd={CODEX_CWD}")
     while True:
+        process_file_send_queue()
         params = {"timeout": 30, "allowed_updates": ["message"]}
         if offset is not None:
             params["offset"] = offset

@@ -414,6 +414,59 @@ class ProcessEnvironmentTests(unittest.TestCase):
                 self.assertEqual(child_env[key], value)
 
 
+class FileSendTests(unittest.TestCase):
+    def test_file_send_queue_only_accepts_tenant_outbox_and_reports_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            accounts_dir = root / "accounts"
+            queue_dir = root / "queue"
+            result_dir = root / "result"
+            outbox = accounts_dir / "42" / "outbox"
+            outbox.mkdir(parents=True)
+            source = outbox / "answer.txt"
+            source.write_text("готово", encoding="utf-8")
+            (queue_dir / "request-1.json").parent.mkdir()
+            (queue_dir / "request-1.json").write_text(
+                json.dumps({"chat_id": 42, "path": str(source), "caption": "ответ"}),
+                encoding="utf-8",
+            )
+            with patch.object(bot, "ACCOUNTS_DIR", accounts_dir), \
+                    patch.object(bot, "FILE_SEND_QUEUE_DIR", queue_dir), \
+                    patch.object(bot, "FILE_SEND_RESULT_DIR", result_dir), \
+                    patch.object(bot, "load_whitelist", return_value={"42"}), \
+                    patch.object(bot, "send_document", return_value={"ok": True}) as send:
+                bot.process_file_send_queue()
+
+            send.assert_called_once_with(42, source.resolve(), "ответ")
+            result = json.loads((result_dir / "request-1.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["ok"])
+            self.assertIn("answer.txt", result["text"])
+
+    def test_file_send_queue_rejects_file_outside_tenant_outbox(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            queue_dir = root / "queue"
+            result_dir = root / "result"
+            outside = root / "secret.txt"
+            outside.write_text("нет", encoding="utf-8")
+            queue_dir.mkdir()
+            (queue_dir / "request-2.json").write_text(
+                json.dumps({"chat_id": 42, "path": str(outside), "caption": ""}),
+                encoding="utf-8",
+            )
+            with patch.object(bot, "ACCOUNTS_DIR", root / "accounts"), \
+                    patch.object(bot, "FILE_SEND_QUEUE_DIR", queue_dir), \
+                    patch.object(bot, "FILE_SEND_RESULT_DIR", result_dir), \
+                    patch.object(bot, "load_whitelist", return_value={"42"}), \
+                    patch.object(bot, "send_document") as send:
+                bot.process_file_send_queue()
+
+            send.assert_not_called()
+            result = json.loads((result_dir / "request-2.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["ok"])
+            self.assertIn("CODEX_TELEGRAM_OUTBOX", result["text"])
+
+
 class BridgeExecTests(unittest.TestCase):
     def test_repeated_env_flags_are_written_to_external_request(self):
         with tempfile.TemporaryDirectory() as temp_dir:

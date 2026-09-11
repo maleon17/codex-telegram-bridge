@@ -21,6 +21,8 @@ collapsible process log.
 - Context compaction through `thread/compact/start` (`/compact`).
 - Detailed `/usage`: session tokens, context size, subscription limits and reset times.
 - Photos and image documents passed to Codex as `localImage` inputs.
+- Agents can return generated files through a tenant-scoped Telegram MCP tool;
+  the bot token remains outside the agent process.
 - Model, sandbox and workspace controls per user.
 - Deferred restarts that never terminate an active answer.
 - Multi-account isolation with a separate `CODEX_HOME` and App Server process per user.
@@ -124,6 +126,11 @@ Each additional user gets independent:
 - sessions and usage;
 - model, sandbox and workspace;
 - active-turn and stop state.
+
+To send a generated file back to the user, an agent places it in
+`CODEX_TELEGRAM_OUTBOX` and calls the `send_telegram_file` MCP tool with the
+absolute path. The bridge accepts only regular files from that per-user outbox
+and delivers them to the same Telegram chat; it never exposes the bot token.
 
 Removing an ID from `whitelist.txt` blocks new messages immediately. Existing
 credentials remain on disk; remove `accounts/<id>/` separately only if you
