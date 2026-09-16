@@ -89,6 +89,9 @@ FILE_SEND_QUEUE_DIR = Path(__file__).with_name("file_send_queue")
 FILE_SEND_RESULT_DIR = Path(__file__).with_name("file_send_result")
 FILE_SEND_MAX_BYTES = 50 * 1024 * 1024
 FILE_SEND_MAX_CAPTION_CHARS = 1024
+INCOMING_FILE_MAX_BYTES = 50 * 1024 * 1024
+TEXT_DOCUMENT_MAX_BYTES = 1024 * 1024
+TURN_STOP_WAIT_S = 10
 
 state_lock = threading.RLock()
 process_lock = threading.RLock()
@@ -149,6 +152,9 @@ class TenantRuntime:
         self.batch_generation = 0
         self.pending_env = None
         self.close_app_server_after_turn = False
+        self.cancel_requested = False
+        self.worker_done = threading.Event()
+        self.worker_done.set()
 
 
 tenants = {}
@@ -325,7 +331,7 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
     global rate_limit_until
     with telegram_lock:
         now = time.monotonic()
-        if now < rate_limit_until:
+        if now < rate_limit_until and method != "getUpdates":
             remaining = max(1, int(rate_limit_until - now + 0.999))
             result = {
                 "ok": False,
@@ -370,14 +376,27 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
     return result
 
 
-def download_telegram_file(file_id, suggested_name="image.jpg"):
+def tenant_upload_dir(chat_id):
+    path = ACCOUNTS_DIR / str(chat_id) / "uploads"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+class UnsupportedAttachmentError(RuntimeError):
+    pass
+
+
+def download_telegram_file(file_id, suggested_name="image.jpg", chat_id=None,
+                           max_bytes=INCOMING_FILE_MAX_BYTES):
     """Download an owner-sent Telegram file for App Server localImage input."""
     result = tg_call("getFile", {"file_id": file_id})
     remote_path = (result.get("result") or {}).get("file_path") if result.get("ok") else None
     if not remote_path:
         raise RuntimeError("Telegram не вернул путь к файлу")
     suffix = Path(suggested_name).suffix or Path(remote_path).suffix or ".jpg"
-    media_dir = Path(tempfile.gettempdir()) / "codex-telegram-bot-media"
+    media_dir = tenant_upload_dir(chat_id) if chat_id is not None else (
+        Path(tempfile.gettempdir()) / "codex-telegram-bot-media"
+    )
     media_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, local_path = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=media_dir)
     try:
@@ -389,6 +408,8 @@ def download_telegram_file(file_id, suggested_name="image.jpg"):
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
+                if handle.tell() + len(chunk) > max_bytes:
+                    raise UnsupportedAttachmentError("Файл слишком большой и не прочитан.")
                 handle.write(chunk)
         return local_path
     except Exception:
@@ -522,14 +543,66 @@ def message_inputs(message):
     paths = []
     if text_parts:
         inputs.append({"type": "text", "text": "\n\n".join(text_parts)})
+    chat_id = message.get("chat", {}).get("id")
     if isinstance(photo, list) and photo:
-        path = download_telegram_file(photo[-1]["file_id"], "photo.jpg")
+        path = download_telegram_file(photo[-1]["file_id"], "photo.jpg", chat_id=chat_id)
         paths.append(path)
         inputs.append({"type": "localImage", "path": path})
     if str(document.get("mime_type", "")).startswith("image/") and document.get("file_id"):
-        path = download_telegram_file(document["file_id"], document.get("file_name") or "image")
+        path = download_telegram_file(document["file_id"], document.get("file_name") or "image", chat_id=chat_id)
         paths.append(path)
         inputs.append({"type": "localImage", "path": path})
+
+    if document and not has_image:
+        mime = str(document.get("mime_type") or "").lower()
+        name = str(document.get("file_name") or "document")
+        if not document.get("file_id"):
+            raise UnsupportedAttachmentError("Файл не прочитан: Telegram не передал его идентификатор.")
+        supported_binary = mime in {"application/pdf"}
+        textual = (mime.startswith("text/") or mime in {
+            "application/json", "application/xml", "application/javascript",
+            "application/x-javascript", "application/yaml", "text/markdown",
+        } or Path(name).suffix.lower() in {
+            ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".py", ".js",
+            ".ts", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".sh", ".sql",
+        })
+        if not (textual or supported_binary):
+            raise UnsupportedAttachmentError("Файл не прочитан: этот формат не поддерживается.")
+        path = download_telegram_file(document["file_id"], name, chat_id=chat_id)
+        paths.append(path)
+        if textual:
+            try:
+                if Path(path).stat().st_size > TEXT_DOCUMENT_MAX_BYTES:
+                    raise UnsupportedAttachmentError("Файл не прочитан: текстовый файл слишком большой.")
+                contents = Path(path).read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise UnsupportedAttachmentError("Файл не прочитан: текстовый формат имеет неверную кодировку.") from exc
+            inputs.append({"type": "text", "text": f"[Документ {name}]\n{contents}"})
+        else:
+            inputs.append({"type": "text", "text": (
+                f"[Прикреплён файл {name}; локальный путь: {path}. "
+                "Используй этот путь для чтения вложения.]"
+            )})
+
+    voice = message.get("voice") or message.get("audio")
+    if voice:
+        if not voice.get("file_id"):
+            # Synthetic/legacy forwarded metadata can describe audio without
+            # a downloadable file.  Preserve the attachment note already
+            # added above rather than pretending it was transcribed.
+            return inputs, paths
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError as exc:
+            raise UnsupportedAttachmentError(
+                "Голосовые сообщения не поддерживаются на этой установке."
+            ) from exc
+        path = download_telegram_file(voice["file_id"], "voice.ogg", chat_id=chat_id)
+        paths.append(path)
+        transcript = transcribe_voice(path)
+        if not transcript:
+            raise UnsupportedAttachmentError("Голосовое сообщение не удалось распознать и оно не прочитано.")
+        inputs.append({"type": "text", "text": f"[Расшифровка голосового сообщения]\n{transcript}"})
 
     if not inputs and attachment_note:
         inputs.append({"type": "text", "text": "[Вложение: " + attachment_note + "]"})
@@ -615,6 +688,106 @@ def write_last_turn(chat_id, text, delegated=False, ok=None):
         os.replace(tmp, path)
     except OSError as exc:
         log(f"write_last_turn failed: {exc}")
+
+
+DELIVERY_MAX_ATTEMPTS = 8
+DELIVERY_FIRST_RETRY_S = 30
+_delivery_guard = threading.Lock()
+_delivering_keys = set()
+
+
+def _set_pending_delivery(state_key, chat_id, answer, delegated):
+    # The turn itself makes the first attempt right away; the background
+    # retry loop only picks the entry up once next_retry_at has passed.
+    update_state(state_key, pending_delivery={
+        "chat_id": int(chat_id), "text": answer, "delegated": bool(delegated),
+        "parts": split_rich_text(answer), "next_part": 0,
+        "attempts": 0, "next_retry_at": time.time() + DELIVERY_FIRST_RETRY_S,
+    })
+
+
+def _confirm_delivery(state_key, chat_id, answer, delegated):
+    update_state(state_key, pending_delivery=None)
+    write_last_turn(chat_id, answer, delegated=delegated, ok=True)
+
+
+def _schedule_delivery_retry(state_key, delivery, parts, next_part):
+    attempts = int(delivery.get("attempts") or 0) + 1
+    chat_id, answer = delivery.get("chat_id"), delivery.get("text")
+    delegated = bool(delivery.get("delegated"))
+    if attempts >= DELIVERY_MAX_ATTEMPTS:
+        log(f"Giving up delivering final answer for {state_key} after {attempts} attempts")
+        update_state(state_key, pending_delivery=None)
+        write_last_turn(chat_id, answer, delegated=delegated, ok=False)
+        return
+    update_state(state_key, pending_delivery=dict(
+        delivery, parts=parts, next_part=next_part, attempts=attempts,
+        next_retry_at=time.time() + min(300, 2 ** attempts),
+    ))
+
+
+def _deliver_pending(state_key, delivery, progress_message_id=None):
+    """Deliver from the first unacknowledged rich chunk, never re-send an acked one.
+
+    Only one delivery per state key runs at a time, so the background retry
+    loop cannot duplicate an attempt the finishing turn is still making.
+    """
+    with _delivery_guard:
+        if state_key in _delivering_keys:
+            return {"ok": False, "in_flight": True, "description": "delivery already in progress"}
+        _delivering_keys.add(state_key)
+    try:
+        return _deliver_pending_exclusive(state_key, delivery, progress_message_id)
+    finally:
+        with _delivery_guard:
+            _delivering_keys.discard(state_key)
+
+
+def _deliver_pending_exclusive(state_key, delivery, progress_message_id):
+    chat_id, answer = delivery.get("chat_id"), delivery.get("text")
+    if not isinstance(chat_id, int) or not isinstance(answer, str):
+        update_state(state_key, pending_delivery=None)
+        return {"ok": False, "description": "invalid pending delivery"}
+    parts = delivery.get("parts")
+    if not isinstance(parts, list) or not all(isinstance(part, str) for part in parts):
+        parts = split_rich_text(answer)
+    next_part = int(delivery.get("next_part") or 0)
+    for index in range(next_part, len(parts)):
+        if index == 0 and progress_message_id is not None:
+            # The first chunk replaces the live progress card so it never
+            # stays stuck showing an in-progress state.
+            result = edit_rich(chat_id, progress_message_id, parts[0])
+        else:
+            result = send_rich(chat_id, parts[index])
+        if not result.get("ok"):
+            _schedule_delivery_retry(state_key, delivery, parts, index)
+            return result
+        delivery = dict(delivery, parts=parts, next_part=index + 1)
+        if index + 1 < len(parts):
+            update_state(state_key, pending_delivery=delivery)
+    _confirm_delivery(state_key, chat_id, answer, bool(delivery.get("delegated")))
+    return {"ok": True}
+
+
+def retry_pending_deliveries():
+    """Retry due finals that have never received a successful Telegram ack."""
+    now = time.time()
+    with state_lock:
+        pending = [
+            (key, dict(value.get("pending_delivery") or {}))
+            for key, value in state_db.get("chats", {}).items()
+            if isinstance(value.get("pending_delivery"), dict)
+        ]
+    for state_key, delivery in pending:
+        if float(delivery.get("next_retry_at") or 0) > now:
+            continue
+        _deliver_pending(state_key, delivery)
+
+
+def pending_delivery_watcher():
+    while True:
+        retry_pending_deliveries()
+        time.sleep(1)
 
 
 def _save_state_locked():
@@ -932,20 +1105,64 @@ def send_plain(chat_id, text):
     return last
 
 
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+
+def transcribe_voice(path):
+    """Lazily transcribe voice only when faster-whisper is installed."""
+    global _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+            _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+        segments, _info = _whisper_model.transcribe(path, beam_size=5)
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+
 def edit_plain(chat_id, message_id, text):
     return tg_call("editMessageText", {
         "chat_id": chat_id, "message_id": message_id, "text": text[:MAX_MESSAGE_LEN]
     })
 
 
+def split_rich_text(markdown_text, limit=RICH_MAX_CHARS):
+    """Split final rich text at paragraphs/lines while balancing fenced code."""
+    text = str(markdown_text or "")
+    if len(text) <= limit:
+        return [text]
+    parts, current, in_fence = [], "", False
+    for line in text.splitlines(keepends=True):
+        if len(line) > limit:
+            pieces = [line[index:index + max(1, limit - 8)]
+                      for index in range(0, len(line), max(1, limit - 8))]
+        else:
+            pieces = [line]
+        for piece in pieces:
+            closing = "\n```" if in_fence else ""
+            opening = "```\n" if in_fence else ""
+            if current and len(current) + len(piece) + len(closing) > limit:
+                parts.append((current.rstrip() + closing).rstrip())
+                current = opening
+            current += piece
+            if piece.count("```") % 2:
+                in_fence = not in_fence
+    if current:
+        parts.append((current.rstrip() + ("\n```" if in_fence else "")).rstrip())
+    return parts
+
+
 def send_rich(chat_id, markdown_text):
-    text = markdown_text[:RICH_MAX_CHARS]
-    result = tg_call("sendRichMessage", {
-        "chat_id": chat_id, "rich_message": {"markdown": text}
-    })
-    if not result.get("ok") and not _rate_limited(result):
-        return send_plain(chat_id, markdown_text)
-    return result
+    last = {"ok": True}
+    for text in split_rich_text(markdown_text):
+        last = tg_call("sendRichMessage", {
+            "chat_id": chat_id, "rich_message": {"markdown": text}
+        })
+        if not last.get("ok"):
+            if not _rate_limited(last):
+                return send_plain(chat_id, text)
+            return last
+    return last
 
 
 def send_document(chat_id, path, caption=""):
@@ -1097,8 +1314,16 @@ def process_file_send_queue():
             log(f"Could not write file-send result {request_id}: {exc}")
 
 
+def file_send_queue_watcher():
+    """Keep MCP file delivery responsive while Telegram is long-polling."""
+    while True:
+        process_file_send_queue()
+        time.sleep(1)
+
+
 def edit_rich(chat_id, message_id, markdown_text):
-    text = markdown_text[:RICH_MAX_CHARS]
+    chunks = split_rich_text(markdown_text)
+    text = chunks[0]
     params = {
         "chat_id": chat_id, "message_id": message_id,
         "rich_message": {"markdown": text},
@@ -1118,7 +1343,12 @@ def edit_rich(chat_id, message_id, markdown_text):
     if not result.get("ok") and not _rate_limited(result):
         description = str(result.get("description", "")).lower()
         if "not modified" not in description:
-            return edit_plain(chat_id, message_id, markdown_text)
+            return edit_plain(chat_id, message_id, text)
+    if result.get("ok"):
+        for chunk in chunks[1:]:
+            result = send_rich(chat_id, chunk)
+            if not result.get("ok"):
+                return result
     return result
 
 
@@ -1349,7 +1579,9 @@ class TurnView:
                     session_usage=None,
                     context_window=None,
                 )
-        write_last_turn(self.chat_id, answer, delegated=self.delegated)
+        _set_pending_delivery(self.state_key, self.chat_id, answer, self.delegated)
+        with state_lock:
+            delivery = dict(chat_state(self.state_key).get("pending_delivery") or {})
 
         if process_items:
             process_steps = [
@@ -1382,14 +1614,13 @@ class TurnView:
             # edited card (matching a since-reverted change on the Claude
             # bridge side) silently killed the "your answer is ready"
             # notification for every tool-using turn.
-            send_rich(self.chat_id, answer)
+            result = _deliver_pending(self.state_key, delivery)
         elif self.progress_msg_id is not None:
-            if not self.replace_progress(answer):
-                # Last-resort delivery only when Telegram rejected the edit;
-                # a successful edit remains the sole final message.
-                send_rich(self.chat_id, answer)
+            result = _deliver_pending(self.state_key, delivery, self.progress_msg_id)
         else:
-            send_rich(self.chat_id, answer)
+            result = _deliver_pending(self.state_key, delivery)
+        if not result.get("ok") and not result.get("in_flight"):
+            write_last_turn(self.chat_id, answer, delegated=self.delegated, ok=False)
 
 
 def codex_process_env(runtime, extra_env=None):
@@ -1669,10 +1900,10 @@ def render_model_picker(runtime):
     for model in models:
         key = model_key(model)
         name = model.get("displayName") or key
-        lines.append(f"{'●' if key == current else '○'} {name} — /model {key}")
+        lines.append(f"{'●' if key == current else '○'} {name} — `/model {key}`")
     if not models:
         lines.append("Список моделей пуст.")
-    return "\n".join(lines)
+    return "  \n".join(lines)
 
 
 def render_effort_picker(runtime):
@@ -1685,11 +1916,11 @@ def render_effort_picker(runtime):
     for option in effort_options(chosen):
         effort = option["reasoningEffort"]
         description = option.get("description")
-        line = f"{'●' if effort == current else '○'} {effort} — /effort {effort}"
+        line = f"{'●' if effort == current else '○'} {effort} — `/effort {effort}`"
         if description:
-            line += f"\n   {description}"
+            line += f"  \n   {description}"
         lines.append(line)
-    return "\n".join(lines)
+    return "  \n".join(lines)
 
 
 def ensure_thread(runtime, client, requested_thread_id):
@@ -1701,11 +1932,20 @@ def ensure_thread(runtime, client, requested_thread_id):
     method = "thread/resume" if requested_thread_id else "thread/start"
     try:
         result = client.request(method, _thread_params(runtime, requested_thread_id), timeout=60)
-    except AppServerError:
+    except AppServerError as exc:
         if not requested_thread_id:
             raise
-        log(f"Could not resume thread {requested_thread_id}; starting a new thread")
+        message = str(exc).lower()
+        missing = any(marker in message for marker in (
+            # Exact wording emitted by codex app-server for a missing thread.
+            "thread not found", "no rollout found for thread id",
+            "no rollout found for conversation id", "invalid thread id",
+        ))
+        if not missing:
+            raise
+        log(f"Thread {requested_thread_id} no longer exists; starting a new thread")
         result = client.request("thread/start", _thread_params(runtime), timeout=60)
+        send_plain(runtime.chat_id, "Прежняя сессия не найдена; начата новая сессия Codex.")
     thread_id = ((result or {}).get("thread") or {}).get("id")
     if not thread_id:
         raise AppServerError(f"{method} returned no thread id")
@@ -1734,8 +1974,18 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
     paths = []
     close_after_turn_client = None
     try:
+        with process_lock:
+            runtime.worker_done.clear()
+            cancelled = runtime.cancel_requested
+        if cancelled:
+            view.deliver(stopped=True)
+            return
         client = get_app_server(runtime)
         client.start_if_needed()
+        with process_lock:
+            if runtime.cancel_requested:
+                view.deliver(stopped=True)
+                return
         with state_lock:
             needs_model_settings = not (
                 chat_state(runtime.state_key).get("model")
@@ -1743,6 +1993,10 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
             )
         if needs_model_settings:
             selected_model(runtime)
+        with process_lock:
+            if runtime.cancel_requested:
+                view.deliver(stopped=True)
+                return
         server_thread_id = ensure_thread(runtime, client, thread_id)
         with state_lock:
             snapshot = dict(chat_state(runtime.state_key))
@@ -1756,6 +2010,10 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
             runtime.active_last_event_at = time.monotonic()
             runtime.active_media_paths = list(media_paths or [])
         view.flush(force=True)
+        with process_lock:
+            if runtime.cancel_requested:
+                view.deliver(stopped=True)
+                return
         params = {
             "threadId": server_thread_id,
             "input": inputs,
@@ -1774,6 +2032,9 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
         turn_id = ((result or {}).get("turn") or {}).get("id")
         with process_lock:
             runtime.active_turn_id = runtime.active_turn_id or turn_id
+            cancelled = runtime.cancel_requested
+        if cancelled:
+            stop_current_process(runtime)
         started_at = time.monotonic()
         while not done.wait(1):
             with process_lock:
@@ -1815,6 +2076,8 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
             paths = runtime.active_media_paths
             runtime.active_media_paths = []
             runtime.busy = False
+            runtime.cancel_requested = False
+            runtime.worker_done.set()
         for path in paths:
             try:
                 os.unlink(path)
@@ -2240,15 +2503,38 @@ def stop_current_process(runtime):
         client = runtime.app_server
         thread_id = runtime.active_thread_id
         turn_id = runtime.active_turn_id
-        if client is None or not thread_id or not turn_id:
+        if not runtime.busy:
             return False
         runtime.active_stopped = True
+        runtime.cancel_requested = True
+        done = runtime.active_done
+        if client is None or not thread_id or not turn_id:
+            return True
     try:
         client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
         return True
     except Exception as exc:
         log(f"Could not interrupt turn: {exc}")
+        # A failed interrupt leaves the tenant's old runtime untrustworthy.
+        with process_lock:
+            if runtime.app_server is client:
+                runtime.app_server = None
+                runtime.loaded_thread_id = None
+                runtime.loaded_server_pid = None
+        client.close()
+        if done is not None:
+            done.set()
+        return True
+
+
+def stop_and_wait_for_worker(runtime):
+    """Prevent /new and /resume from overlapping the previous worker cleanup."""
+    running = stop_current_process(runtime)
+    with process_lock:
+        finished = runtime.worker_done
+    if running and not finished.wait(TURN_STOP_WAIT_S):
         return False
+    return True
 
 
 def steer_current_turn(runtime, inputs, media_paths=None):
@@ -2356,6 +2642,8 @@ def flush_pending_batch(runtime, timer, generation):
         already_busy = runtime.busy
         if not already_busy:
             runtime.busy = True
+            runtime.cancel_requested = False
+            runtime.worker_done.clear()
 
     inputs, media_paths = combine_input_batch(entries)
     if already_busy:
@@ -2377,6 +2665,8 @@ def flush_pending_batch(runtime, timer, generation):
                 _requeue_batch(runtime, entries)
                 return
             runtime.busy = True
+            runtime.cancel_requested = False
+            runtime.worker_done.clear()
 
     with state_lock:
         thread_id = chat_state(runtime.state_key).get("thread_id")
@@ -2446,6 +2736,8 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
         if not delegate_busy:
             cancel_pending_batch(runtime)
             runtime.busy = True
+            runtime.cancel_requested = False
+            runtime.worker_done.clear()
             if not requested_thread_id:
                 if runtime.app_server is not None:
                     # A fresh delegation must not inherit background work from
@@ -2597,9 +2889,6 @@ def handle_command(chat_id, command, runtime=None):
     raw_cmd, _, arg = command.partition(" ")
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
-    if cmd in {"new", "resume", "compact", "model", "effort", "mode",
-               "workspace", "restart", "update", "stop"}:
-        cancel_pending_batch(runtime)
     if cmd in ("start", "help"):
         send_plain(chat_id, "Codex Telegram bridge. Команды доступны в меню бота.")
         return True
@@ -2610,7 +2899,10 @@ def handle_command(chat_id, command, runtime=None):
         send_plain(chat_id, account_status_report(runtime))
         return True
     if cmd == "new":
-        stop_current_process(runtime)
+        if not stop_and_wait_for_worker(runtime):
+            send_plain(chat_id, "Предыдущий ход ещё завершается; /new пока не выполнен.")
+            return True
+        cancel_pending_batch(runtime)
         update_state(state_key, thread_id=None, last_usage=None, session_usage=None, context_window=None)
         send_plain(chat_id, "🆕 Текущий Codex-тред сброшен. Следующее сообщение начнёт новый.")
         return True
@@ -2628,7 +2920,10 @@ def handle_command(chat_id, command, runtime=None):
         if len(matches) != 1:
             send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")
         else:
-            stop_current_process(runtime)
+            if not stop_and_wait_for_worker(runtime):
+                send_plain(chat_id, "Предыдущий ход ещё завершается; /resume пока не выполнен.")
+                return True
+            cancel_pending_batch(runtime)
             update_state(state_key, thread_id=matches[0], last_usage=None, session_usage=None, context_window=None)
             send_plain(chat_id, f"Продолжаю сессию {matches[0][:8]}.")
         return True
@@ -2674,16 +2969,19 @@ def handle_command(chat_id, command, runtime=None):
         try:
             models = available_models(runtime)
             if not arg:
-                send_plain(chat_id, render_model_picker(runtime))
+                send_rich(chat_id, render_model_picker(runtime))
                 return True
             chosen = resolve_model_choice(models, arg)
             if chosen is None:
-                send_plain(chat_id, f"Модель «{arg}» недоступна.\n\n{render_model_picker(runtime)}")
+                send_rich(chat_id, f"Модель «{arg}» недоступна.\n\n{render_model_picker(runtime)}")
                 return True
             supported = supported_reasoning_efforts(chosen)
             current_effort = chat_state(state_key).get("effort")
             effort = (current_effort if current_effort in supported else
                       chosen.get("defaultReasoningEffort") or (supported[0] if supported else None))
+            if (chat_state(state_key).get("model") != model_key(chosen)
+                    or chat_state(state_key).get("effort") != effort):
+                cancel_pending_batch(runtime)
             update_state(state_key, model=model_key(chosen), effort=effort)
             send_plain(chat_id, f"🧠 Модель: {chosen.get('displayName') or model_key(chosen)}\n"
                        f"Мощность: {effort or 'не поддерживается'}")
@@ -2698,13 +2996,15 @@ def handle_command(chat_id, command, runtime=None):
                 send_plain(chat_id, "Codex не вернул доступных моделей.")
                 return True
             if not arg:
-                send_plain(chat_id, render_effort_picker(runtime))
+                send_rich(chat_id, render_effort_picker(runtime))
                 return True
             effort = resolve_effort_choice(chosen, arg)
             if effort is None:
-                send_plain(chat_id, f"Мощность «{arg}» недоступна для {model_key(chosen)}.\n\n"
-                           f"{render_effort_picker(runtime)}")
+                send_rich(chat_id, f"Мощность «{arg}» недоступна для {model_key(chosen)}.\n\n"
+                          f"{render_effort_picker(runtime)}")
                 return True
+            if chat_state(state_key).get("effort") != effort:
+                cancel_pending_batch(runtime)
             update_state(state_key, effort=effort)
             send_plain(chat_id, f"⚡ Мощность {chosen.get('displayName') or model_key(chosen)}: {effort}")
         except Exception as exc:
@@ -2717,6 +3017,8 @@ def handle_command(chat_id, command, runtime=None):
         if arg not in aliases:
             send_plain(chat_id, "Использование: /mode read-only|workspace-write|full")
         else:
+            if chat_state(state_key).get("sandbox") != aliases[arg]:
+                cancel_pending_batch(runtime)
             update_state(state_key, sandbox=aliases[arg])
             send_plain(chat_id, f"Sandbox: {aliases[arg]}.")
         return True
@@ -2727,6 +3029,8 @@ def handle_command(chat_id, command, runtime=None):
         elif not os.path.isdir(path):
             send_plain(chat_id, f"Директория не существует: {path}")
         else:
+            if chat_state(state_key).get("workspace") != path:
+                cancel_pending_batch(runtime)
             update_state(state_key, workspace=path)
             send_plain(chat_id, f"Workspace: {path}")
         return True
@@ -2734,16 +3038,14 @@ def handle_command(chat_id, command, runtime=None):
         if chat_id != OWNER_ID:
             send_plain(chat_id, "Перезапуск доступен только владельцу бота.")
             return True
+        cancel_pending_batch(runtime)
         request_restart(chat_id)
-        if runtime.busy or runtime.pending_batch:
-            send_plain(chat_id, "🔁 Перезапуск запланирован после завершения текущего хода.")
-        else:
-            send_plain(chat_id, "🔁 Перезапуск запланирован между ходами.")
         return True
     if cmd == "update":
         if chat_id != OWNER_ID:
             send_plain(chat_id, "Обновление доступно только владельцу бота.")
             return True
+        cancel_pending_batch(runtime)
         send_plain(chat_id, "⬇️ Обновляю из git...")
         script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.sh")
         try:
@@ -2769,6 +3071,7 @@ def handle_command(chat_id, command, runtime=None):
             send_plain(chat_id, f"✅ {summary}\n🔁 Перезапуск запланирован между ходами.")
         return True
     if cmd == "stop":
+        cancel_pending_batch(runtime)
         running = stop_current_process(runtime)
         if running:
             send_plain(chat_id, "⏹ Останавливаю текущее выполнение Codex.")
@@ -2809,7 +3112,10 @@ def handle_message(message):
     # A forwarded message is data, not a command.  Otherwise forwarding a
     # message beginning with /new or /stop would execute that command instead
     # of sending the forwarded content to Codex.
-    if text.startswith(("/", ".")) and not forwarded and not rich_message:
+    has_media = any(message.get(field) for field in (
+        "photo", "document", "animation", "video", "video_note", "voice", "audio", "sticker",
+    ))
+    if text.startswith(("/", ".")) and not forwarded and not rich_message and not has_media:
         command_name = text.split(None, 1)[0].split("@", 1)[0].lstrip("/.").lower()
         command_runtime = active_delegate_tenant(chat_id) if command_name == "stop" else None
         handle_command(chat_id, text, runtime=command_runtime)
@@ -2837,6 +3143,9 @@ def handle_message(message):
         return
     try:
         inputs, media_paths = message_inputs(message)
+    except UnsupportedAttachmentError as exc:
+        send_plain(chat_id, str(exc))
+        return
     except Exception as exc:
         send_plain(chat_id, f"Не смог обработать вложение: {compact(str(exc), 500)}")
         return
@@ -2883,9 +3192,11 @@ def main():
     threading.Thread(target=restart_watcher, daemon=True).start()
     threading.Thread(target=external_request_watcher, daemon=True).start()
     threading.Thread(target=cross_delegate_watcher, daemon=True).start()
+    threading.Thread(target=file_send_queue_watcher, daemon=True).start()
+    threading.Thread(target=pending_delivery_watcher, daemon=True).start()
+    retry_pending_deliveries()
     log(f"Codex Telegram bot started; owner={OWNER_ID}, cwd={CODEX_CWD}")
     while True:
-        process_file_send_queue()
         params = {"timeout": 30, "allowed_updates": ["message"]}
         if offset is not None:
             params["offset"] = offset

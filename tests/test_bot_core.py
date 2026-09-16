@@ -830,21 +830,26 @@ class ModelCommandTests(unittest.TestCase):
 
     def setUp(self):
         self.original_models = bot.available_models
-        self.original_send = bot.send_plain
+        self.original_send_plain = bot.send_plain
+        self.original_send_rich = bot.send_rich
         bot.available_models = lambda runtime: self.CATALOG
         self.messages = []
+        self.rich_messages = []
         bot.send_plain = lambda chat_id, text: self.messages.append(text)
+        bot.send_rich = lambda chat_id, text: self.rich_messages.append(text)
         bot.update_state(1, model=None, effort=None)
 
     def tearDown(self):
         bot.available_models = self.original_models
-        bot.send_plain = self.original_send
+        bot.send_plain = self.original_send_plain
+        bot.send_rich = self.original_send_rich
 
     def test_model_without_argument_lists_real_models_and_selects_actual_default(self):
         bot.handle_command(1, "/model")
-        text = self.messages[-1]
-        self.assertIn("/model gpt-5.6-sol", text)
-        self.assertIn("/model gpt-5.6-luna", text)
+        text = self.rich_messages[-1]
+        self.assertIn("`/model gpt-5.6-sol`", text)
+        self.assertIn("`/model gpt-5.6-luna`", text)
+        self.assertIn("  \n", text)
         self.assertNotIn("default", text.lower())
         self.assertEqual(bot.chat_state(1)["model"], "gpt-5.6-sol")
         self.assertEqual(bot.chat_state(1)["effort"], "low")
@@ -852,10 +857,30 @@ class ModelCommandTests(unittest.TestCase):
     def test_effort_without_argument_lists_only_current_model_levels(self):
         bot.handle_command(1, "/model gpt-5.6-sol")
         bot.handle_command(1, "/effort")
-        self.assertIn("/effort low", self.messages[-1])
-        self.assertIn("/effort high", self.messages[-1])
+        self.assertIn("`/effort low`", self.rich_messages[-1])
+        self.assertIn("`/effort high`", self.rich_messages[-1])
+        self.assertIn("`/effort low`  \n   Fast", self.rich_messages[-1])
         bot.handle_command(1, "/effort high")
         self.assertEqual(bot.chat_state(1)["effort"], "high")
+
+
+class RestartCommandTests(unittest.TestCase):
+    def test_restart_queues_silently_until_it_finishes(self):
+        messages = []
+
+        class Runtime:
+            state_key = bot.OWNER_ID
+            busy = False
+            pending_batch = False
+
+        with patch.object(bot, "get_tenant", return_value=Runtime()):
+            with patch.object(bot, "cancel_pending_batch"):
+                with patch.object(bot, "request_restart") as request:
+                    with patch.object(bot, "send_plain", side_effect=lambda chat_id, text: messages.append(text)):
+                        self.assertTrue(bot.handle_command(bot.OWNER_ID, "/restart"))
+
+        request.assert_called_once_with(bot.OWNER_ID)
+        self.assertEqual(messages, [])
 
 
 if __name__ == "__main__":
