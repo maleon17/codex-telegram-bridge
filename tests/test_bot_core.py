@@ -542,6 +542,7 @@ class DelegationTests(unittest.TestCase):
             session_usage=None,
             context_window=None,
             pending_delegator_session_id=None,
+            resume_selected=False,
         )
         bot.update_state(
             self.delegate.state_key,
@@ -554,6 +555,7 @@ class DelegationTests(unittest.TestCase):
             session_usage=None,
             context_window=None,
             pending_delegator_session_id=None,
+            resume_selected=False,
         )
 
     def tearDown(self):
@@ -562,6 +564,7 @@ class DelegationTests(unittest.TestCase):
             self.delegate.busy = False
             self.owner.pending_batch = []
             self.delegate.pending_batch = []
+        bot.update_state(self.delegate.state_key, resume_selected=False)
         for path in (
             Path(bridge_exec.last_turn_path(bot.OWNER_ID)),
             Path(bridge_exec.last_turn_path(bot.OWNER_ID, delegated=True)),
@@ -764,6 +767,29 @@ class DelegationTests(unittest.TestCase):
                 )
             )
         self.assertTrue(any("Нельзя продолжить" in message for message in messages))
+
+    def test_footer_resume_finds_the_delegate_home_and_selects_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_home = root / "shared"
+            shared_home.mkdir()
+            for filename in ("auth.json", "config.toml"):
+                (shared_home / filename).write_text(filename, encoding="utf-8")
+            with patch.object(bot, "ACCOUNTS_DIR", root / "accounts"), \
+                    patch.dict(os.environ, {"CODEX_HOME": str(shared_home)}, clear=False):
+                delegate_home = bot.tenant_codex_home(
+                    self.delegate.chat_id, state_key=self.delegate.state_key,
+                )
+                (delegate_home / "sessions").mkdir()
+                sid = "de1e6a7e-1111-4222-8333-444444444444"
+                (delegate_home / "sessions" / f"{sid}.jsonl").write_text("", encoding="utf-8")
+                with patch.object(bot, "stop_and_wait_for_worker", return_value=True), \
+                        patch.object(bot, "send_plain") as sent:
+                    bot.handle_command(bot.OWNER_ID, "/resume de1e6a7e")
+                self.assertEqual(bot.chat_state(self.delegate.state_key)["thread_id"], sid)
+                self.assertTrue(bot.chat_state(self.delegate.state_key)["resume_selected"])
+                self.assertIs(bot.active_delegate_tenant(bot.OWNER_ID), self.delegate)
+                self.assertIn("делегированную", sent.call_args.args[1])
 
     def test_owner_message_steers_busy_delegate(self):
         self.delegate.busy = True

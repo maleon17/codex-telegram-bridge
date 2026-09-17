@@ -187,8 +187,9 @@ def active_delegate_tenant(chat_id):
     chat_id = int(chat_id)
     with process_lock:
         runtime = tenants_delegate.get(chat_id)
-        if runtime is not None and (runtime.busy or runtime.pending_batch):
-            return runtime
+        active = runtime is not None and (runtime.busy or runtime.pending_batch)
+    if runtime is not None and (active or chat_state(runtime.state_key).get("resume_selected", False)):
+        return runtime
     return None
 
 
@@ -2915,17 +2916,38 @@ def handle_command(chat_id, command, runtime=None):
         send_plain(chat_id, "Последние сессии:\n" + ("\n".join(rows) or "не найдены"))
         return True
     if cmd == "resume":
-        matches = [sid for path in session_files(runtime) for sid, _ in [session_info(path)]
-                   if arg and sid.startswith(arg)]
+        # Delegated turns deliberately use a separate CODEX_HOME so their
+        # session files cannot pollute the owner's normal conversation.
+        # The delegation footer nevertheless offers /resume, so search both
+        # stores and remember which runtime owns the selected session.
+        owner_runtime = get_tenant(chat_id)
+        delegate_runtime = get_delegate_tenant(chat_id)
+        matches = []
+        for candidate_runtime in (owner_runtime, delegate_runtime):
+            matches.extend(
+                (candidate_runtime, sid)
+                for path in session_files(candidate_runtime)
+                for sid, _ in [session_info(path)]
+                if arg and sid.startswith(arg)
+            )
         if len(matches) != 1:
             send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")
         else:
-            if not stop_and_wait_for_worker(runtime):
+            target_runtime, thread_id = matches[0]
+            if not stop_and_wait_for_worker(target_runtime):
                 send_plain(chat_id, "Предыдущий ход ещё завершается; /resume пока не выполнен.")
                 return True
-            cancel_pending_batch(runtime)
-            update_state(state_key, thread_id=matches[0], last_usage=None, session_usage=None, context_window=None)
-            send_plain(chat_id, f"Продолжаю сессию {matches[0][:8]}.")
+            cancel_pending_batch(target_runtime)
+            update_state(
+                target_runtime.state_key, thread_id=thread_id, last_usage=None,
+                session_usage=None, context_window=None,
+            )
+            update_state(
+                delegate_runtime.state_key,
+                resume_selected=(target_runtime is delegate_runtime),
+            )
+            kind = "делегированную " if target_runtime is delegate_runtime else ""
+            send_plain(chat_id, f"Продолжаю {kind}сессию {thread_id[:8]}.")
         return True
     if cmd == "status":
         try:
@@ -3117,7 +3139,7 @@ def handle_message(message):
     ))
     if text.startswith(("/", ".")) and not forwarded and not rich_message and not has_media:
         command_name = text.split(None, 1)[0].split("@", 1)[0].lstrip("/.").lower()
-        command_runtime = active_delegate_tenant(chat_id) if command_name == "stop" else None
+        command_runtime = active_delegate_tenant(chat_id) or owner_runtime
         handle_command(chat_id, text, runtime=command_runtime)
         return
     runtime = active_delegate_tenant(chat_id) or owner_runtime
