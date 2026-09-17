@@ -143,9 +143,8 @@ Jarvis, the Telethon userbot module, Telegram-account actions and triggers live
 in the separate `/home/mishin/codex-jarvis` product. The two applications do
 not import one another and have independent sessions and runtime processes.
 
-The only shared piece is the small local command queue used to relay actions;
-it is transport infrastructure, not part of this bot's model or Telegram
-interface.
+The applications do not share command queues. This bot's own filesystem
+channels are private runtime transport for its MCP/file delivery path.
 
 ## Runtime files and backup
 

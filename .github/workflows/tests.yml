@@ -1,0 +1,9 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m py_compile bot.py app_server.py
+      - run: TELEGRAM_BOT_TOKEN=000000:review OWNER_ID=1 python -m unittest discover -s tests -v
