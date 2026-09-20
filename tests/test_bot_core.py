@@ -313,6 +313,22 @@ class RenderingTests(unittest.TestCase):
     def test_empty_reasoning_is_not_rendered_as_a_blank_step(self):
         self.assertEqual(bot.render_process_item({"type": "reasoning", "summary": []}), "")
 
+    def test_completed_image_generation_collects_the_saved_image_path(self):
+        view = bot.TurnView(1)
+        view.add_event({"type": "item.completed", "item": {
+            "type": "image_generation", "savedPath": "/tmp/generated.png",
+        }})
+        view.add_event({"type": "item.completed", "item": {
+            "type": "image_generation", "saved_path": "/tmp/second.png",
+        }})
+        view.add_event({"type": "item.completed", "item": {
+            "type": "image_generation", "savedPath": "/tmp/generated.png",
+        }})
+        self.assertEqual(
+            view.generated_image_paths,
+            ["/tmp/generated.png", "/tmp/second.png"],
+        )
+
     def test_usage_limit_has_actionable_message(self):
         message = bot.user_facing_codex_error({
             "message": "usage limit reached",

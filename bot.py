@@ -89,6 +89,7 @@ FILE_SEND_QUEUE_DIR = Path(__file__).with_name("file_send_queue")
 FILE_SEND_RESULT_DIR = Path(__file__).with_name("file_send_result")
 FILE_SEND_MAX_BYTES = 50 * 1024 * 1024
 FILE_SEND_MAX_CAPTION_CHARS = 1024
+PHOTO_SEND_MAX_BYTES = 10 * 1024 * 1024
 INCOMING_FILE_MAX_BYTES = 50 * 1024 * 1024
 TEXT_DOCUMENT_MAX_BYTES = 1024 * 1024
 TURN_STOP_WAIT_S = 10
@@ -1234,6 +1235,55 @@ def send_document(chat_id, path, caption=""):
     return result
 
 
+def send_photo(chat_id, path, caption=""):
+    """Upload an App Server-generated image as a Telegram photo.
+
+    Telegram previews photos inline, which is the expected result of the
+    image-generation tool. Oversized outputs still arrive as documents
+    rather than disappearing.
+    """
+    source = Path(path)
+    if not source.is_file():
+        return {"ok": False, "description": "Файл изображения не найден."}
+    if source.stat().st_size > PHOTO_SEND_MAX_BYTES:
+        return send_document(chat_id, source, caption)
+
+    boundary = f"----CodexTelegramPhoto{time.time_ns()}"
+    body = bytearray()
+    for key, value in (("chat_id", str(chat_id)), ("caption", caption[:FILE_SEND_MAX_CAPTION_CHARS])):
+        if not value:
+            continue
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+    filename = source.name.replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
+    mime = mimetypes.guess_type(filename)[0] or "image/png"
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
+    body.extend(f"Content-Type: {mime}\r\n\r\n".encode())
+    with source.open("rb") as handle:
+        body.extend(handle.read())
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    request = urllib.request.Request(
+        f"{API_BASE}/sendPhoto", data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            result = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            result = {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+    if not result.get("ok"):
+        log(f"Telegram sendPhoto not ok: {result}")
+    return result
+
+
 def _write_file_send_result(request_id, ok, text):
     FILE_SEND_RESULT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = FILE_SEND_RESULT_DIR / f"{request_id}.json"
@@ -1360,6 +1410,7 @@ class TurnView:
         self.delegated = self.state_key != str(self.chat_id)
         self.items = []
         self.process_items = []
+        self.generated_image_paths = []
         self.current_thought = None
         self.current_thought_id = None
         self.current_tool = None
@@ -1432,6 +1483,12 @@ class TurnView:
                 else:
                     self.current_tool = item
                 self.process_items.append(item)
+                if item_type == "image_generation":
+                    # App Server calls this savedPath; accept snake_case too
+                    # so the bridge remains compatible with older servers.
+                    image_path = item.get("savedPath") or item.get("saved_path")
+                    if isinstance(image_path, str) and image_path not in self.generated_image_paths:
+                        self.generated_image_paths.append(image_path)
         elif event_type == "turn.completed":
             self.completed = True
             self.usage = event.get("usage")
@@ -1620,6 +1677,11 @@ class TurnView:
             result = _deliver_pending(self.state_key, delivery, self.progress_msg_id)
         else:
             result = _deliver_pending(self.state_key, delivery)
+        if result.get("ok"):
+            for image_path in self.generated_image_paths:
+                image_result = send_photo(self.chat_id, image_path)
+                if not image_result.get("ok"):
+                    log(f"Could not deliver generated image {image_path}: {image_result}")
         if not result.get("ok") and not result.get("in_flight"):
             write_last_turn(self.chat_id, answer, delegated=self.delegated, ok=False)
 
