@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily Telegram Bot API file cleanup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

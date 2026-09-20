@@ -62,6 +62,45 @@ Check the installation:
 journalctl -u codex-telegram-bot -f
 ```
 
+## Local Bot API server (optional)
+
+Telegram's cloud Bot API accepts files up to 20 MB. Optionally, `setup.sh` can
+build and configure one shared, loopback-only
+[`telegram-bot-api --local`](https://github.com/tdlib/telegram-bot-api) server;
+that raises upload and download limits to 2 GB and lets the bot use local file
+paths. It remains optional: leave the local-server question empty and the bot
+continues to use `https://api.telegram.org` as before.
+
+The installer builds a pinned official source revision, stores `api_id` and
+`api_hash` only in a mode-`600` environment file, creates a systemd service and
+a daily cleanup timer. It never asks for those credentials when a healthy shared
+server already exists. Run its plan without changing the machine with:
+
+```bash
+scripts/install-local-bot-api.sh --dry-run
+```
+
+The shared-server settings may be overridden before invoking the installer:
+`TELEGRAM_BOT_API_UNIT` (default `telegram-bot-api`),
+`TELEGRAM_BOT_API_PORT` (default `8081`), `TELEGRAM_BOT_API_DIR` (default
+`$HOME/.local/share/telegram-bot-api`), `TELEGRAM_BOT_API_ENV_FILE` (default
+`$HOME/.config/telegram-bot-api/env`), `TELEGRAM_BOT_API_BIN`,
+`TELEGRAM_BOT_API_REF`, and `TELEGRAM_BOT_API_RETENTION_DAYS` (default `7`).
+The data directory is retained, while the cleanup timer removes files older
+than the configured number of days.
+
+After the installer is ready, setup verifies the bot against the cloud API,
+asks for explicit confirmation, calls cloud `logOut`, then verifies the bot
+through the local URL and writes `TELEGRAM_API_URL=http://127.0.0.1:<port>` to
+the bot's `.env`. `logOut` is one-way for roughly 10 minutes: do not switch
+back to the cloud API during that interval. The local server is deliberately
+shared by projects on the same machine; each bot still has its own token.
+
+To return to the cloud API, first log the bot out through its local API using a
+credential-safe client, stop the bot, wait about 10 minutes, remove
+`TELEGRAM_API_URL` from the bot's protected `.env`, and start the bot again.
+Do not place a bot token in a shell command, service unit, or repository file.
+
 ## Manual install
 
 1. Clone the repository and run `codex login` as the Linux user that will run the service.

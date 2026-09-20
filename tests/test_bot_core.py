@@ -134,7 +134,7 @@ class RenderingTests(unittest.TestCase):
         )
 
     def test_forwarded_text_preserves_origin_as_prompt_context(self):
-        inputs, paths = bot.message_inputs({
+        inputs, paths, failures = bot.message_inputs({
             "text": "Проверь это",
             "forward_origin": {
                 "type": "user",
@@ -142,16 +142,18 @@ class RenderingTests(unittest.TestCase):
             },
         })
         self.assertEqual(paths, [])
+        self.assertEqual(failures, [])
         self.assertEqual(len(inputs), 1)
         self.assertIn("Пересланное сообщение от Андрей (@andrey)", inputs[0]["text"])
         self.assertIn("Проверь это", inputs[0]["text"])
 
     def test_forwarded_rich_message_is_converted_to_prompt_text(self):
-        inputs, paths = bot.message_inputs({
+        inputs, paths, failures = bot.message_inputs({
             "forward_origin": {"type": "hidden_user", "sender_user_name": "Автор"},
             "rich_message": {"markdown": "**Ответ из другого чата**\n\nПроверь это."},
         })
         self.assertEqual(paths, [])
+        self.assertEqual(failures, [])
         self.assertEqual(
             inputs,
             [{"type": "text", "text": "[Пересланное сообщение от Автор]\n\n**Ответ из другого чата**\n\nПроверь это."}],
@@ -171,13 +173,14 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("**Ответ**", queued[0][0]["text"])
 
     def test_forwarded_non_image_media_is_not_silently_dropped(self):
-        inputs, paths = bot.message_inputs({
+        inputs, paths, failures = bot.message_inputs({
             "voice": {"duration": 4, "mime_type": "audio/ogg"},
             "forward_origin": {
                 "type": "hidden_user", "sender_user_name": "Скрытый автор",
             },
         })
         self.assertEqual(paths, [])
+        self.assertEqual(failures, [])
         self.assertEqual(len(inputs), 1)
         self.assertIn("Скрытый автор", inputs[0]["text"])
         self.assertIn("голосовое сообщение", inputs[0]["text"])

@@ -13,8 +13,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from app_server import AppServerClient, AppServerError
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
@@ -26,6 +28,9 @@ BATCH_RETRY_S = 0.2
 MAX_MESSAGE_LEN = 4000
 RICH_MAX_CHARS = 30000
 HTTP_TIMEOUT_S = 20
+LOCAL_GET_FILE_TIMEOUT_S = 600
+LOCAL_SEND_TIMEOUT_S = 600
+TELEGRAM_CLOUD_FILE_MAX_BYTES = 20 * 1024 * 1024
 IDLE_TIMEOUT_S = 300
 TOTAL_TIMEOUT_S = 1800
 COMMANDS = [
@@ -58,6 +63,33 @@ def require_env(name):
     return value
 
 
+def env_positive_int(name, default):
+    """Read a positive integer environment setting without accepting nonsense."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log(f"Ignoring invalid {name}; using {default}")
+        return default
+    if value <= 0:
+        log(f"Ignoring non-positive {name}; using {default}")
+        return default
+    return value
+
+
+def telegram_api_config(value):
+    """Return the normalized API root and whether it is a local Bot API."""
+    root = (value or "https://api.telegram.org").strip().rstrip("/")
+    parsed = urlsplit(root)
+    if not parsed.scheme or not parsed.netloc:
+        raise SystemExit("codex-telegram-bot: TELEGRAM_API_URL must be an absolute URL")
+    hostname = (parsed.hostname or "").lower()
+    is_local = bool(value and hostname != "api.telegram.org")
+    return root, is_local
+
+
 BOT_TOKEN = require_env("TELEGRAM_BOT_TOKEN")
 try:
     OWNER_ID = int(require_env("OWNER_ID"))
@@ -73,7 +105,9 @@ STATE_INSTANCE_NAME = STATE_FILE.stem
 RESTART_SIGNAL_FILE = Path(os.environ.get(
     "CODEX_BOT_RESTART_FILE", Path(__file__).with_name("restart.request")
 )).expanduser()
-API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API_URL, LOCAL_BOT_API = telegram_api_config(os.environ.get("TELEGRAM_API_URL"))
+API_BASE = f"{TELEGRAM_API_URL}/bot{BOT_TOKEN}"
+FILE_API_BASE = f"{TELEGRAM_API_URL}/file/bot{BOT_TOKEN}"
 WHITELIST_FILE = Path(os.environ.get(
     "CODEX_BOT_WHITELIST_FILE", Path(__file__).with_name("whitelist.txt")
 )).expanduser()
@@ -87,10 +121,20 @@ CROSS_DELEGATE_QUEUE_DIR = Path(__file__).with_name("cross_delegate_queue")
 CROSS_DELEGATE_RESULT_DIR = Path(__file__).with_name("cross_delegate_result")
 FILE_SEND_QUEUE_DIR = Path(__file__).with_name("file_send_queue")
 FILE_SEND_RESULT_DIR = Path(__file__).with_name("file_send_result")
-FILE_SEND_MAX_BYTES = 50 * 1024 * 1024
+FILE_SEND_MAX_BYTES = env_positive_int(
+    "FILE_SEND_MAX_BYTES", 2000 * 1024 * 1024 if LOCAL_BOT_API else 50 * 1024 * 1024,
+)
 FILE_SEND_MAX_CAPTION_CHARS = 1024
 PHOTO_SEND_MAX_BYTES = 10 * 1024 * 1024
-INCOMING_FILE_MAX_BYTES = 50 * 1024 * 1024
+INCOMING_FILE_MAX_BYTES = env_positive_int(
+    "INCOMING_FILE_MAX_BYTES", 2000 * 1024 * 1024 if LOCAL_BOT_API else 50 * 1024 * 1024,
+)
+GET_FILE_TIMEOUT_S = env_positive_int(
+    "TELEGRAM_GET_FILE_TIMEOUT_S", LOCAL_GET_FILE_TIMEOUT_S if LOCAL_BOT_API else HTTP_TIMEOUT_S,
+)
+SEND_TIMEOUT_S = env_positive_int(
+    "TELEGRAM_SEND_TIMEOUT_S", LOCAL_SEND_TIMEOUT_S if LOCAL_BOT_API else HTTP_TIMEOUT_S,
+)
 TEXT_DOCUMENT_MAX_BYTES = 1024 * 1024
 TURN_STOP_WAIT_S = 10
 
@@ -160,6 +204,10 @@ class TenantRuntime:
 
 tenants = {}
 tenants_delegate = {}
+# A local getFile call may wait while telegram-bot-api fetches a large upload.
+# Each chat gets its own worker so that later updates cannot overtake that
+# download, while independent chats continue immediately.
+local_message_queues = {}
 
 
 def get_tenant(chat_id):
@@ -388,42 +436,138 @@ class UnsupportedAttachmentError(RuntimeError):
     pass
 
 
+class AttachmentDownloadError(UnsupportedAttachmentError):
+    """A download failure with a stable machine-readable reason for callers."""
+
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _download_error_from_exception(exc):
+    if isinstance(exc, TimeoutError):
+        return AttachmentDownloadError(
+            "timeout", "Файл не скачан: Telegram слишком долго готовил файл. Попробуй ещё раз или дай ссылку."
+        )
+    if isinstance(exc, PermissionError):
+        return AttachmentDownloadError(
+            "local_file_access", "Файл не скачан: нет доступа к файлу локального Bot API. Проверь права сервера и бота."
+        )
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
+        return AttachmentDownloadError(
+            "no_space", "Файл не скачан: на диске нет места. Освободи место и отправь файл снова."
+        )
+    if isinstance(exc, (urllib.error.URLError, ConnectionError, OSError)):
+        return AttachmentDownloadError(
+            "network", "Файл не скачан: ошибка связи с Telegram. Попробуй ещё раз или дай ссылку."
+        )
+    return AttachmentDownloadError(
+        "download_failed", "Файл не скачан: Telegram не дал получить файл. Попробуй ещё раз или дай ссылку."
+    )
+
+
+def _get_file_error(result):
+    detail = str(result.get("error") or result.get("description") or "").lower()
+    if not LOCAL_BOT_API and "file is too big" in detail:
+        return AttachmentDownloadError(
+            "too_big_for_cloud",
+            "Файл не скачан: размер файла превышает облачный лимит Telegram 20 МБ. "
+            "Включи локальный Bot API сервер в setup.sh или дай ссылку.",
+        )
+    if "timed out" in detail or "timeout" in detail:
+        return AttachmentDownloadError(
+            "timeout", "Файл не скачан: Telegram слишком долго готовил файл. Попробуй ещё раз или дай ссылку."
+        )
+    if result.get("error"):
+        return AttachmentDownloadError(
+            "network", "Файл не скачан: ошибка связи с Telegram. Попробуй ещё раз или дай ссылку."
+        )
+    return AttachmentDownloadError(
+        "get_file_failed", "Файл не скачан: Telegram отказал в выдаче файла. Отправь его снова или дай ссылку."
+    )
+
+
 def download_telegram_file(file_id, suggested_name="image.jpg", chat_id=None,
-                           max_bytes=INCOMING_FILE_MAX_BYTES):
+                           max_bytes=INCOMING_FILE_MAX_BYTES, file_size=None):
     """Download an owner-sent Telegram file for App Server localImage input."""
-    result = tg_call("getFile", {"file_id": file_id})
+    if not LOCAL_BOT_API and isinstance(file_size, int) and file_size > TELEGRAM_CLOUD_FILE_MAX_BYTES:
+        size_mb = file_size / (1024 * 1024)
+        raise AttachmentDownloadError(
+            "too_big_for_cloud",
+            "Файл не скачан: размер "
+            f"{size_mb:.1f} МБ превышает облачный лимит Telegram 20 МБ. "
+            "Включи локальный Bot API сервер в setup.sh или дай ссылку.",
+        )
+    result = tg_call("getFile", {"file_id": file_id}, timeout=GET_FILE_TIMEOUT_S)
+    if not result.get("ok"):
+        raise _get_file_error(result)
     remote_path = (result.get("result") or {}).get("file_path") if result.get("ok") else None
     if not remote_path:
-        raise RuntimeError("Telegram не вернул путь к файлу")
+        raise AttachmentDownloadError(
+            "get_file_failed", "Файл не скачан: Telegram не вернул путь к файлу. Попробуй ещё раз или дай ссылку."
+        )
     suffix = Path(suggested_name).suffix or Path(remote_path).suffix or ".jpg"
     media_dir = tenant_upload_dir(chat_id) if chat_id is not None else (
         Path(tempfile.gettempdir()) / "codex-telegram-bot-media"
     )
-    media_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd, local_path = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=media_dir)
+    local_path = None
     try:
+        media_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, local_path = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=media_dir)
+        os.close(fd)
+        source = Path(remote_path)
+        if LOCAL_BOT_API and source.is_absolute():
+            try:
+                source_stat = source.stat()
+            except FileNotFoundError:
+                raise AttachmentDownloadError(
+                    "local_file_missing",
+                    "Файл не скачан: локальный Bot API больше не видит этот файл. Отправь его снова или дай ссылку.",
+                )
+            except PermissionError:
+                raise AttachmentDownloadError(
+                    "local_file_access",
+                    "Файл не скачан: нет доступа к файлу локального Bot API. Проверь права сервера и бота.",
+                )
+            if not source.is_file():
+                raise AttachmentDownloadError(
+                    "local_file_access",
+                    "Файл не скачан: путь локального Bot API не является доступным файлом. Проверь права сервера и бота.",
+                )
+            if source_stat.st_size > max_bytes:
+                raise AttachmentDownloadError(
+                    "too_big", "Файл не скачан: размер превышает разрешённый лимит. Отправь меньший файл или дай ссылку."
+                )
+            shutil.move(str(source), local_path)
+            return local_path
         with urllib.request.urlopen(
-            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{remote_path}",
+            f"{FILE_API_BASE}/{remote_path}",
             timeout=HTTP_TIMEOUT_S,
-        ) as response, os.fdopen(fd, "wb") as handle:
+        ) as response, open(local_path, "wb") as handle:
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 if handle.tell() + len(chunk) > max_bytes:
-                    raise UnsupportedAttachmentError("Файл слишком большой и не прочитан.")
+                    raise AttachmentDownloadError(
+                        "too_big", "Файл не скачан: размер превышает разрешённый лимит. Отправь меньший файл или дай ссылку."
+                    )
                 handle.write(chunk)
         return local_path
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(local_path)
-        except FileNotFoundError:
-            pass
+    except AttachmentDownloadError:
+        if local_path is not None:
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
         raise
+    except Exception as exc:
+        if local_path is not None:
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
+        raise _download_error_from_exception(exc) from exc
 
 
 FORWARD_FIELDS = (
@@ -514,6 +658,16 @@ def message_attachment_note(message):
     return ", ".join(notes)
 
 
+def add_attachment_failure(inputs, failures, exc):
+    """Keep a failed attachment visible both to the user and to the agent."""
+    failures.append(exc)
+    detail = str(exc).removeprefix("Файл не скачан: ")
+    inputs.append({
+        "type": "text",
+        "text": f"[Файл не скачан: {detail}. Не ищи его на диске.]",
+    })
+
+
 def message_inputs(message):
     """Build App Server inputs from text, forwards and image media.
 
@@ -543,17 +697,30 @@ def message_inputs(message):
 
     inputs = []
     paths = []
+    failures = []
     if text_parts:
         inputs.append({"type": "text", "text": "\n\n".join(text_parts)})
     chat_id = message.get("chat", {}).get("id")
     if isinstance(photo, list) and photo:
-        path = download_telegram_file(photo[-1]["file_id"], "photo.jpg", chat_id=chat_id)
-        paths.append(path)
-        inputs.append({"type": "localImage", "path": path})
+        try:
+            path = download_telegram_file(
+                photo[-1]["file_id"], "photo.jpg", chat_id=chat_id,
+                file_size=photo[-1].get("file_size"),
+            )
+            paths.append(path)
+            inputs.append({"type": "localImage", "path": path})
+        except AttachmentDownloadError as exc:
+            add_attachment_failure(inputs, failures, exc)
     if str(document.get("mime_type", "")).startswith("image/") and document.get("file_id"):
-        path = download_telegram_file(document["file_id"], document.get("file_name") or "image", chat_id=chat_id)
-        paths.append(path)
-        inputs.append({"type": "localImage", "path": path})
+        try:
+            path = download_telegram_file(
+                document["file_id"], document.get("file_name") or "image", chat_id=chat_id,
+                file_size=document.get("file_size"),
+            )
+            paths.append(path)
+            inputs.append({"type": "localImage", "path": path})
+        except AttachmentDownloadError as exc:
+            add_attachment_failure(inputs, failures, exc)
 
     if document and not has_image:
         mime = str(document.get("mime_type") or "").lower()
@@ -570,7 +737,15 @@ def message_inputs(message):
         })
         if not (textual or supported_binary):
             raise UnsupportedAttachmentError("Файл не прочитан: этот формат не поддерживается.")
-        path = download_telegram_file(document["file_id"], name, chat_id=chat_id)
+        try:
+            path = download_telegram_file(
+                document["file_id"], name, chat_id=chat_id, file_size=document.get("file_size"),
+            )
+        except AttachmentDownloadError as exc:
+            add_attachment_failure(inputs, failures, exc)
+            path = None
+        if path is None:
+            return inputs, paths, failures
         paths.append(path)
         if textual:
             try:
@@ -592,14 +767,20 @@ def message_inputs(message):
             # Synthetic/legacy forwarded metadata can describe audio without
             # a downloadable file.  Preserve the attachment note already
             # added above rather than pretending it was transcribed.
-            return inputs, paths
+            return inputs, paths, failures
         try:
             import faster_whisper  # noqa: F401
         except ImportError as exc:
             raise UnsupportedAttachmentError(
                 "Голосовые сообщения не поддерживаются на этой установке."
             ) from exc
-        path = download_telegram_file(voice["file_id"], "voice.ogg", chat_id=chat_id)
+        try:
+            path = download_telegram_file(
+                voice["file_id"], "voice.ogg", chat_id=chat_id, file_size=voice.get("file_size"),
+            )
+        except AttachmentDownloadError as exc:
+            add_attachment_failure(inputs, failures, exc)
+            return inputs, paths, failures
         paths.append(path)
         transcript = transcribe_voice(path)
         if not transcript:
@@ -615,7 +796,7 @@ def message_inputs(message):
         if origin_note:
             prompt = f"{origin_note}\n\n{prompt}"
         inputs.insert(0, {"type": "text", "text": prompt})
-    return inputs, paths
+    return inputs, paths, failures
 
 
 def load_state():
@@ -1177,6 +1358,35 @@ def send_document(chat_id, path, caption=""):
             "ok": False,
             "description": f"Файл больше лимита {FILE_SEND_MAX_BYTES} байт.",
         }
+    if LOCAL_BOT_API:
+        local_result = tg_call("sendDocument", {
+            "chat_id": chat_id,
+            "caption": caption[:FILE_SEND_MAX_CAPTION_CHARS],
+            "document": source.resolve().as_uri(),
+        }, timeout=SEND_TIMEOUT_S)
+        if local_result.get("ok"):
+            return local_result
+        # Retry only a confirmed Bot API rejection. A timeout or other
+        # transport failure leaves the outcome unknown: the local server may
+        # still finish sending the file, so retrying could duplicate it.
+        locally_suppressed = (
+            local_result.get("description") == "locally suppressed during Telegram rate limit"
+        )
+        if ("description" not in local_result and "error_code" not in local_result) or locally_suppressed:
+            if locally_suppressed:
+                return local_result
+            detail = str(local_result.get("error") or "неизвестная ошибка связи")
+            return {
+                "ok": False,
+                "error": local_result.get("error"),
+                "description": (
+                    "Не удалось подтвердить отправку файла: ошибка связи или таймаут "
+                    f"({detail}). Файл не был отправлен повторно, чтобы избежать дубля."
+                ),
+            }
+        # A local Bot API can reject file:// when the bot and server do not
+        # share a mount. Its documented fallback is the normal upload.
+        log(f"Telegram local sendDocument rejected file://; retrying multipart: {local_result}")
     with telegram_lock:
         now = time.monotonic()
         if now < rate_limit_until:
@@ -1213,7 +1423,9 @@ def send_document(chat_id, path, caption=""):
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+        with urllib.request.urlopen(
+            request, timeout=SEND_TIMEOUT_S if LOCAL_BOT_API else HTTP_TIMEOUT_S,
+        ) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
@@ -3168,6 +3380,60 @@ def handle_command(chat_id, command, runtime=None):
     return False
 
 
+def process_message_inputs(runtime, message):
+    """Download media and queue its inputs without holding the update poller."""
+    chat_id = message.get("chat", {}).get("id")
+    try:
+        inputs, media_paths, attachment_failures = message_inputs(message)
+    except UnsupportedAttachmentError as exc:
+        send_plain(chat_id, str(exc))
+        return
+    except Exception as exc:
+        send_plain(chat_id, f"Не смог обработать вложение: {compact(str(exc), 500)}")
+        return
+    for failure in attachment_failures:
+        send_plain(chat_id, str(failure))
+    if inputs:
+        queue_message(runtime, inputs, media_paths)
+
+
+def _process_local_message_queue(chat_id):
+    """Process one chat's local-Bot-API updates in their arrival order."""
+    while True:
+        with process_lock:
+            queue_state = local_message_queues.get(chat_id)
+            if queue_state is None or not queue_state["messages"]:
+                local_message_queues.pop(chat_id, None)
+                return
+            runtime, message = queue_state["messages"].popleft()
+        try:
+            process_message_inputs(runtime, message)
+        except Exception as exc:
+            # process_message_inputs handles normal attachment errors itself;
+            # this last guard ensures an unexpected failure cannot strand a
+            # chat's later updates behind this worker.
+            log(f"chat={chat_id} local message worker failed: {exc}")
+
+
+def queue_local_message(runtime, message):
+    """Append a local-mode update and ensure its per-chat FIFO worker runs."""
+    chat_id = runtime.chat_id
+    start_worker = False
+    with process_lock:
+        queue_state = local_message_queues.get(chat_id)
+        if queue_state is None:
+            queue_state = {"messages": deque(), "running": False}
+            local_message_queues[chat_id] = queue_state
+        queue_state["messages"].append((runtime, message))
+        if not queue_state["running"]:
+            queue_state["running"] = True
+            start_worker = True
+    if start_worker:
+        threading.Thread(
+            target=_process_local_message_queue, args=(chat_id,), daemon=True,
+        ).start()
+
+
 def handle_message(message):
     chat_id = message.get("chat", {}).get("id")
     user_id = message.get("from", {}).get("id")
@@ -3225,17 +3491,12 @@ def handle_message(message):
         else:
             threading.Thread(target=start_account_login, args=(runtime,), daemon=True).start()
         return
-    try:
-        inputs, media_paths = message_inputs(message)
-    except UnsupportedAttachmentError as exc:
-        send_plain(chat_id, str(exc))
+    if LOCAL_BOT_API:
+        # A later text or another attachment must not overtake a getFile that
+        # is still downloading for this chat. Other chats have other workers.
+        queue_local_message(runtime, message)
         return
-    except Exception as exc:
-        send_plain(chat_id, f"Не смог обработать вложение: {compact(str(exc), 500)}")
-        return
-    if not inputs:
-        return
-    queue_message(runtime, inputs, media_paths)
+    process_message_inputs(runtime, message)
 
 
 def register_commands():

@@ -1,0 +1,9 @@
+[Unit]
+Description=Remove expired Telegram Bot API files
+
+[Service]
+Type=oneshot
+# TDLib stores each bot below __DATA_DIR__.  Its database/binlog files share
+# that bot directory, so never delete files at that level (depth 2); only prune older
+# nested cache candidates.  The explicit exclusions also protect service state.
+ExecStart=/usr/bin/find __DATA_DIR__ -xdev -mindepth 3 -type f ! -path __DATA_DIR__/tmp/* ! -name *.binlog* ! -name *.sqlite* ! -name *.db* -mtime +__RETENTION_DAYS__ -delete

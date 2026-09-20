@@ -93,7 +93,7 @@ class MediaCommandTests(unittest.TestCase):
         message = {"chat": {"id": 1}, "from": {"id": 1}, "caption": "/stop",
                    "document": {"file_id": "d", "file_name": "note.txt", "mime_type": "text/plain"}}
         with patch.object(bot, "load_whitelist", return_value={"1"}), \
-                patch.object(bot, "message_inputs", return_value=([{"type": "text", "text": "/stop"}], [])), \
+                patch.object(bot, "message_inputs", return_value=([{"type": "text", "text": "/stop"}], [], [])), \
                 patch.object(bot, "queue_message", side_effect=lambda *args: queued.append(args)), \
                 patch.object(bot, "handle_command") as command:
             bot.handle_message(message)
@@ -105,7 +105,7 @@ class MediaCommandTests(unittest.TestCase):
         message = {"chat": {"id": 1}, "from": {"id": 1}, "caption": "/workspace /tmp",
                    "document": {"file_id": "d", "file_name": "note.txt", "mime_type": "text/plain"}}
         with patch.object(bot, "load_whitelist", return_value={"1"}), \
-                patch.object(bot, "message_inputs", return_value=([{"type": "text", "text": "/workspace /tmp"}], [])), \
+                patch.object(bot, "message_inputs", return_value=([{"type": "text", "text": "/workspace /tmp"}], [], [])), \
                 patch.object(bot, "queue_message", side_effect=lambda *args: queued.append(args)), \
                 patch.object(bot, "handle_command") as command:
             bot.handle_message(message)
@@ -119,9 +119,10 @@ class IncomingFileTests(unittest.TestCase):
             path = Path(directory) / "note.txt"
             path.write_text("evidence", encoding="utf-8")
             with patch.object(bot, "download_telegram_file", return_value=str(path)):
-                inputs, paths = bot.message_inputs({"chat": {"id": 1}, "caption": "analyse",
+                inputs, paths, failures = bot.message_inputs({"chat": {"id": 1}, "caption": "analyse",
                     "document": {"file_id": "d", "file_name": "note.txt", "mime_type": "text/plain"}})
         self.assertEqual(paths, [str(path)])
+        self.assertEqual(failures, [])
         self.assertTrue(any("evidence" in value.get("text", "") for value in inputs))
 
     def test_pdf_is_explicitly_passed_by_local_path(self):
@@ -129,9 +130,10 @@ class IncomingFileTests(unittest.TestCase):
             path = Path(directory) / "brief.pdf"
             path.write_bytes(b"%PDF")
             with patch.object(bot, "download_telegram_file", return_value=str(path)):
-                inputs, paths = bot.message_inputs({"chat": {"id": 1}, "document": {
+                inputs, paths, failures = bot.message_inputs({"chat": {"id": 1}, "document": {
                     "file_id": "d", "file_name": "brief.pdf", "mime_type": "application/pdf"}})
         self.assertEqual(paths, [str(path)])
+        self.assertEqual(failures, [])
         self.assertTrue(any(str(path) in value.get("text", "") for value in inputs))
 
     def test_voice_without_faster_whisper_is_explicitly_rejected(self):

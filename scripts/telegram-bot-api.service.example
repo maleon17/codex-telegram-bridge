@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Bot API server (local mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+EnvironmentFile=__ENV_FILE__
+ExecStart=__BIN__ --local --http-ip-address=127.0.0.1 --http-port=__PORT__ --dir=__DATA_DIR__ --temp-dir=__TEMP_DIR__
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
