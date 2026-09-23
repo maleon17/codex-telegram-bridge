@@ -372,6 +372,82 @@ class DebounceVsSlowDownloadTests(unittest.TestCase):
         )
 
 
+class ProgressMorphTests(unittest.TestCase):
+    """The local-mode 'Загружаю вложение…' status bubble must become the
+    turn's own Thinking card, not sit next to a second, separate message."""
+
+    def test_preseeded_progress_message_is_edited_not_resent(self):
+        bot = load_bot("http://127.0.0.1:8081/")
+        calls = []
+
+        def fake_tg_call(method, params=None, **_kwargs):
+            calls.append((method, dict(params or {})))
+            return {"ok": True}
+
+        with patch.object(bot, "tg_call", side_effect=fake_tg_call):
+            view = bot.TurnView(1, progress_msg_id=99)
+            view.flush(force=True)
+
+        self.assertEqual(len(calls), 1)
+        method, params = calls[0]
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(params["chat_id"], 1)
+        self.assertEqual(params["message_id"], 99)
+        self.assertIn("Думаю", params["text"])
+
+    def test_without_a_preseed_a_fresh_message_is_sent_as_before(self):
+        bot = load_bot()
+        with patch.object(bot, "tg_call", return_value={"ok": True, "result": {"message_id": 5}}):
+            view = bot.TurnView(1)
+            view.flush(force=True)
+        self.assertEqual(view.progress_msg_id, 5)
+
+    def test_flush_pending_batch_hands_the_status_message_to_run_turn(self):
+        """End-to-end wiring: queue_local_message's status bubble id reaches
+        run_turn, and is cleared from the runtime afterward."""
+        bot = load_bot("http://127.0.0.1:8081/")
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        launched = []
+
+        def message(text, media=False):
+            result = {"chat": {"id": 1}, "from": {"id": 1}, "text": text}
+            if media:
+                result["document"] = {"file_id": text, "file_name": f"{text}.bin"}
+            return result
+
+        with patch.object(bot.threading, "Timer", FakeTimer), \
+                patch.object(bot, "run_turn", lambda *args: launched.append(args)), \
+                patch.object(bot, "message_inputs",
+                             return_value=([{"type": "text", "text": "doc"}], [], [])), \
+                patch.object(bot, "send_plain"), \
+                patch.object(bot, "tg_call",
+                             return_value={"ok": True, "result": {"message_id": 77}}):
+            bot.handle_message(message("doc", media=True))
+            for _ in range(200):
+                if 1 not in bot.local_message_queues:
+                    break
+                threading.Event().wait(0.01)
+            runtime = bot.get_tenant(1)
+            self.assertEqual(runtime.pending_progress_msg_id, 77)
+            timers[-1].function()
+
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched[0][4], 77)  # progress_msg_id positional arg
+        self.assertIsNone(runtime.pending_progress_msg_id)
+
+
 class GetFileErrorTests(unittest.TestCase):
     def test_cloud_get_file_too_big_description_has_cloud_guidance(self):
         bot = load_bot()

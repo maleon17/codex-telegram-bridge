@@ -200,6 +200,10 @@ class TenantRuntime:
         self.cancel_requested = False
         self.worker_done = threading.Event()
         self.worker_done.set()
+        # The local-mode "📥 Загружаю вложение…" status message (if any) for
+        # the burst currently landing, handed to the next turn's TurnView so
+        # it becomes the Thinking card in place instead of a second message.
+        self.pending_progress_msg_id = None
 
 
 tenants = {}
@@ -1624,7 +1628,7 @@ def edit_rich(chat_id, message_id, markdown_text):
 
 
 class TurnView:
-    def __init__(self, chat_id, state_key=None):
+    def __init__(self, chat_id, state_key=None, progress_msg_id=None):
         self.chat_id = int(chat_id)
         self.state_key = str(state_key if state_key is not None else self.chat_id)
         self.delegated = self.state_key != str(self.chat_id)
@@ -1641,8 +1645,11 @@ class TurnView:
         # A real Telegram message is the live process card.  It is edited in
         # place as App Server events arrive, like the Claude bridge; this is
         # deliberately not Telegram's ephemeral sendMessageDraft API.
-        self.progress_msg_id = None
-        self.progress_attempted = False
+        # A caller may hand in an already-sent message (the local-mode
+        # "Загружаю вложение…" status bubble) to edit into place instead of
+        # sending a fresh one -- see run_turn/flush_pending_batch.
+        self.progress_msg_id = progress_msg_id
+        self.progress_attempted = progress_msg_id is not None
         self.progress_lock = threading.Lock()
 
     @staticmethod
@@ -2248,9 +2255,9 @@ def sandbox_policy(name, workspace):
     return {"type": "dangerFullAccess"}
 
 
-def run_turn(runtime, inputs, thread_id, media_paths=None):
+def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None):
     chat_id = runtime.chat_id
-    view = TurnView(chat_id, state_key=runtime.state_key)
+    view = TurnView(chat_id, state_key=runtime.state_key, progress_msg_id=progress_msg_id)
     done = threading.Event()
     error = None
     stopped = False
@@ -2965,9 +2972,12 @@ def flush_pending_batch(runtime, timer, generation):
 
     with state_lock:
         thread_id = chat_state(runtime.state_key).get("thread_id")
+    with process_lock:
+        progress_msg_id = runtime.pending_progress_msg_id
+        runtime.pending_progress_msg_id = None
     threading.Thread(
         target=run_turn,
-        args=(runtime, inputs, thread_id, media_paths),
+        args=(runtime, inputs, thread_id, media_paths, progress_msg_id),
         daemon=True,
     ).start()
 
@@ -3429,13 +3439,18 @@ def _has_downloadable_media(message):
     return any(message.get(field) for field in DOWNLOADED_MEDIA_FIELDS)
 
 
-def _update_download_status(queue_state, chat_id, force=False):
+def _update_download_status(queue_state, runtime, force=False):
     """Best-effort progress line for a local-mode download in progress.
 
     Not a percentage -- the local Bot API server gives no progress signal
     for an in-flight getFile, only "done" once it has the whole file. Count
     of files finished vs. known-queued is the honest signal we actually have.
+
+    The message this creates is handed to the turn that eventually consumes
+    this burst (see flush_pending_batch/run_turn), which edits it in place
+    into the normal Thinking card instead of leaving two separate messages.
     """
+    chat_id = runtime.chat_id
     total = queue_state["total"]
     done = queue_state["done"]
     text = f"📥 Загружаю вложение ({done}/{total})…" if total > 1 else "📥 Загружаю вложение…"
@@ -3444,8 +3459,12 @@ def _update_download_status(queue_state, chat_id, force=False):
     if msg_id is None:
         result = tg_call("sendMessage", {"chat_id": chat_id, "text": text})
         if result.get("ok"):
-            queue_state["status_msg_id"] = (result.get("result") or {}).get("message_id")
+            msg_id = (result.get("result") or {}).get("message_id")
+            queue_state["status_msg_id"] = msg_id
             queue_state["status_last_edit_at"] = now
+            if msg_id is not None:
+                with process_lock:
+                    runtime.pending_progress_msg_id = msg_id
         return
     if not force and now - queue_state.get("status_last_edit_at", 0.0) < DOWNLOAD_STATUS_EDIT_MIN_INTERVAL_S:
         return
@@ -3465,7 +3484,7 @@ def _process_local_message_queue(chat_id):
         has_media = _has_downloadable_media(message)
         if has_media:
             try:
-                _update_download_status(queue_state, chat_id)
+                _update_download_status(queue_state, runtime)
             except Exception as exc:
                 log(f"chat={chat_id} download status update failed: {exc}")
         try:
@@ -3486,7 +3505,7 @@ def _process_local_message_queue(chat_id):
                 # bubble stuck on a stale count with nothing left to fire a
                 # later edit. If another file arrives after all, its own
                 # "starting" update naturally supersedes this one.
-                _update_download_status(queue_state, chat_id, force=just_completed)
+                _update_download_status(queue_state, runtime, force=just_completed)
             except Exception as exc:
                 log(f"chat={chat_id} download status update failed: {exc}")
 
@@ -3520,7 +3539,7 @@ def queue_local_message(runtime, message):
         # information, not a repetitive tick the throttle is meant to guard
         # against.
         try:
-            _update_download_status(queue_state, chat_id, force=True)
+            _update_download_status(queue_state, runtime, force=True)
         except Exception as exc:
             log(f"chat={chat_id} download status update failed: {exc}")
     if start_worker:
