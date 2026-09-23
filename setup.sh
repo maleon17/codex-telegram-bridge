@@ -204,6 +204,7 @@ umask 077
     printf 'CODEX_BOT_WHITELIST_FILE=%s/whitelist.txt\n' "$INSTALL_DIR"
     printf 'CODEX_BOT_ACCOUNTS_DIR=%s/accounts\n' "$INSTALL_DIR"
     printf 'CODEX_BOT_RESTART_FILE=%s/restart.request\n' "$INSTALL_DIR"
+    printf 'CODEX_BOT_SERVICE_NAME=%s\n' "$SERVICE_NAME"
     [[ -n "$TELEGRAM_API_URL" ]] && printf 'TELEGRAM_API_URL=%s\n' "$TELEGRAM_API_URL"
 } > .env
 chmod 600 .env

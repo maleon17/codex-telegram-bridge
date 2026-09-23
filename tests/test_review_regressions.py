@@ -136,6 +136,29 @@ class IncomingFileTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertTrue(any(str(path) in value.get("text", "") for value in inputs))
 
+    def test_zip_is_explicitly_passed_by_local_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archive.zip"
+            path.write_bytes(b"PK\x03\x04")
+            with patch.object(bot, "download_telegram_file", return_value=str(path)):
+                inputs, paths, failures = bot.message_inputs({"chat": {"id": 1}, "document": {
+                    "file_id": "d", "file_name": "archive.zip", "mime_type": "application/zip"}})
+        self.assertEqual(paths, [str(path)])
+        self.assertEqual(failures, [])
+        self.assertTrue(any(str(path) in value.get("text", "") for value in inputs))
+
+    def test_octet_stream_zip_is_accepted_by_suffix(self):
+        """Telegram clients commonly mislabel archives as application/octet-stream;
+        the file name suffix must still let a real zip through."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archive.zip"
+            path.write_bytes(b"PK\x03\x04")
+            with patch.object(bot, "download_telegram_file", return_value=str(path)):
+                inputs, paths, failures = bot.message_inputs({"chat": {"id": 1}, "document": {
+                    "file_id": "d", "file_name": "archive.zip", "mime_type": "application/octet-stream"}})
+        self.assertEqual(paths, [str(path)])
+        self.assertEqual(failures, [])
+
     def test_voice_without_faster_whisper_is_explicitly_rejected(self):
         original_import = builtins.__import__
 

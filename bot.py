@@ -727,7 +727,16 @@ def message_inputs(message):
         name = str(document.get("file_name") or "document")
         if not document.get("file_id"):
             raise UnsupportedAttachmentError("Файл не прочитан: Telegram не передал его идентификатор.")
-        supported_binary = mime in {"application/pdf"}
+        archive_suffixes = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz"}
+        # Telegram clients are inconsistent about mime typing archives (many
+        # send application/octet-stream) -- suffix is the reliable signal,
+        # same reasoning as the textual check below.
+        supported_binary = mime in {
+            "application/pdf", "application/zip", "application/x-zip-compressed",
+            "application/x-7z-compressed", "application/x-rar-compressed",
+            "application/vnd.rar", "application/x-tar", "application/gzip",
+            "application/x-gzip", "application/x-bzip2", "application/x-xz",
+        } or Path(name).suffix.lower() in archive_suffixes
         textual = (mime.startswith("text/") or mime in {
             "application/json", "application/xml", "application/javascript",
             "application/x-javascript", "application/yaml", "text/markdown",

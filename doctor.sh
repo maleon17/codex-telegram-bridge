@@ -51,8 +51,13 @@ fi
 if [[ -f state.json ]]; then
     check "state.json is valid JSON" python3 -c 'import json; json.load(open("state.json"))'
 fi
-if systemctl list-unit-files codex-telegram-bot.service >/dev/null 2>&1; then
-    check "codex-telegram-bot.service active" systemctl is-active --quiet codex-telegram-bot.service
+BOT_SERVICE_NAME="codex-telegram-bot"
+if [[ -f .env ]]; then
+    CONFIGURED_SERVICE_NAME="$(sed -n 's/^CODEX_BOT_SERVICE_NAME=//p' .env | tail -n 1)"
+    [[ -n "$CONFIGURED_SERVICE_NAME" ]] && BOT_SERVICE_NAME="$CONFIGURED_SERVICE_NAME"
+fi
+if systemctl list-unit-files "${BOT_SERVICE_NAME}.service" >/dev/null 2>&1; then
+    check "${BOT_SERVICE_NAME}.service active" systemctl is-active --quiet "${BOT_SERVICE_NAME}.service"
 fi
 if [[ -f .env ]]; then
     TELEGRAM_API_URL="$(sed -n 's/^TELEGRAM_API_URL=//p' .env | tail -n 1)"
