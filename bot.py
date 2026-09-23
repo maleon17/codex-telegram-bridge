@@ -727,16 +727,13 @@ def message_inputs(message):
         name = str(document.get("file_name") or "document")
         if not document.get("file_id"):
             raise UnsupportedAttachmentError("Файл не прочитан: Telegram не передал его идентификатор.")
-        archive_suffixes = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz"}
-        # Telegram clients are inconsistent about mime typing archives (many
-        # send application/octet-stream) -- suffix is the reliable signal,
-        # same reasoning as the textual check below.
-        supported_binary = mime in {
-            "application/pdf", "application/zip", "application/x-zip-compressed",
-            "application/x-7z-compressed", "application/x-rar-compressed",
-            "application/vnd.rar", "application/x-tar", "application/gzip",
-            "application/x-gzip", "application/x-bzip2", "application/x-xz",
-        } or Path(name).suffix.lower() in archive_suffixes
+        # No format allowlist: the mime/suffix check below only decides HOW
+        # a document is handed to the model (inlined as text vs. left as a
+        # local path for Codex to read itself with its own tools), never
+        # WHETHER it's accepted. A format Codex can't make sense of is its
+        # own problem to report, same as any other unexpected input -- not
+        # something to pre-reject here. The actual safety boundary for what
+        # Codex can DO with an attachment is its sandbox mode, not this gate.
         textual = (mime.startswith("text/") or mime in {
             "application/json", "application/xml", "application/javascript",
             "application/x-javascript", "application/yaml", "text/markdown",
@@ -744,8 +741,6 @@ def message_inputs(message):
             ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".py", ".js",
             ".ts", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".sh", ".sql",
         })
-        if not (textual or supported_binary):
-            raise UnsupportedAttachmentError("Файл не прочитан: этот формат не поддерживается.")
         try:
             path = download_telegram_file(
                 document["file_id"], name, chat_id=chat_id, file_size=document.get("file_size"),
@@ -756,15 +751,19 @@ def message_inputs(message):
         if path is None:
             return inputs, paths, failures
         paths.append(path)
-        if textual:
+        inlined = False
+        if textual and Path(path).stat().st_size <= TEXT_DOCUMENT_MAX_BYTES:
             try:
-                if Path(path).stat().st_size > TEXT_DOCUMENT_MAX_BYTES:
-                    raise UnsupportedAttachmentError("Файл не прочитан: текстовый файл слишком большой.")
                 contents = Path(path).read_text(encoding="utf-8")
-            except UnicodeDecodeError as exc:
-                raise UnsupportedAttachmentError("Файл не прочитан: текстовый формат имеет неверную кодировку.") from exc
-            inputs.append({"type": "text", "text": f"[Документ {name}]\n{contents}"})
-        else:
+            except UnicodeDecodeError:
+                contents = None
+            if contents is not None:
+                inputs.append({"type": "text", "text": f"[Документ {name}]\n{contents}"})
+                inlined = True
+        if not inlined:
+            # Covers every non-textual format, plus a textual file too big
+            # or too oddly encoded to inline -- Codex reads it itself
+            # instead of the attachment being rejected outright.
             inputs.append({"type": "text", "text": (
                 f"[Прикреплён файл {name}; локальный путь: {path}. "
                 "Используй этот путь для чтения вложения.]"

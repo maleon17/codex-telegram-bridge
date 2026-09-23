@@ -159,6 +159,48 @@ class IncomingFileTests(unittest.TestCase):
         self.assertEqual(paths, [str(path)])
         self.assertEqual(failures, [])
 
+    def test_unrecognized_format_is_passed_by_local_path_not_rejected(self):
+        """No attachment format is pre-rejected -- an unknown one still
+        reaches Codex as a local path, same as pdf/zip."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "world.sav"
+            path.write_bytes(b"\x00\x01save-data")
+            with patch.object(bot, "download_telegram_file", return_value=str(path)):
+                inputs, paths, failures = bot.message_inputs({"chat": {"id": 1}, "document": {
+                    "file_id": "d", "file_name": "world.sav", "mime_type": "application/octet-stream"}})
+        self.assertEqual(paths, [str(path)])
+        self.assertEqual(failures, [])
+        self.assertTrue(any(str(path) in value.get("text", "") for value in inputs))
+
+    def test_oversized_text_document_falls_back_to_local_path(self):
+        """A text file too big to inline is still usable, not rejected --
+        mirrors the oversized-text branch existing before this fix, which
+        used to raise UnsupportedAttachmentError instead."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "huge.txt"
+            path.write_text("x" * (bot.TEXT_DOCUMENT_MAX_BYTES + 1), encoding="utf-8")
+            with patch.object(bot, "download_telegram_file", return_value=str(path)):
+                inputs, paths, failures = bot.message_inputs({"chat": {"id": 1}, "document": {
+                    "file_id": "d", "file_name": "huge.txt", "mime_type": "text/plain"}})
+        self.assertEqual(paths, [str(path)])
+        self.assertEqual(failures, [])
+        self.assertTrue(any(str(path) in value.get("text", "") for value in inputs))
+        self.assertFalse(any("xxxx" in value.get("text", "") for value in inputs))
+
+    def test_undecodable_text_suffix_falls_back_to_local_path(self):
+        """A .txt-named file that isn't valid UTF-8 is still usable, not
+        rejected -- mirrors the bad-encoding branch existing before this
+        fix, which used to raise UnsupportedAttachmentError instead."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.txt"
+            path.write_bytes(b"\xff\xfe\x00binary-not-utf8")
+            with patch.object(bot, "download_telegram_file", return_value=str(path)):
+                inputs, paths, failures = bot.message_inputs({"chat": {"id": 1}, "document": {
+                    "file_id": "d", "file_name": "note.txt", "mime_type": "text/plain"}})
+        self.assertEqual(paths, [str(path)])
+        self.assertEqual(failures, [])
+        self.assertTrue(any(str(path) in value.get("text", "") for value in inputs))
+
     def test_voice_without_faster_whisper_is_explicitly_rejected(self):
         original_import = builtins.__import__
 
