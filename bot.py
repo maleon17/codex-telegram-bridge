@@ -2922,11 +2922,23 @@ def flush_pending_batch(runtime, timer, generation):
         runtime.pending_batch = []
         if not entries:
             return
-        already_busy = runtime.busy
-        if not already_busy:
-            runtime.busy = True
-            runtime.cancel_requested = False
-            runtime.worker_done.clear()
+        # A local-mode download for this chat can still be running well past
+        # the debounce window (large file, GET_FILE_TIMEOUT_S up to minutes).
+        # The debounce timer only tracks "quiet since the last item that
+        # FINISHED downloading" -- it has no idea a slower sibling is still
+        # in flight in the same FIFO, so it can and does fire early. Flushing
+        # now would start (or steer) a turn permanently missing that
+        # attachment; wait for the whole burst to finish landing instead.
+        still_downloading = LOCAL_BOT_API and runtime.chat_id in local_message_queues
+        if not still_downloading:
+            already_busy = runtime.busy
+            if not already_busy:
+                runtime.busy = True
+                runtime.cancel_requested = False
+                runtime.worker_done.clear()
+    if still_downloading:
+        _requeue_batch(runtime, entries)
+        return
 
     inputs, media_paths = combine_input_batch(entries)
     if already_busy:

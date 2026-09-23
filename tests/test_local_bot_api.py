@@ -296,6 +296,82 @@ class DownloadStatusTests(unittest.TestCase):
         self.assertIn("(2/2)", edits[-1])
 
 
+class DebounceVsSlowDownloadTests(unittest.TestCase):
+    """The debounce timer tracks wall-clock quiet time, not "is everything
+    in this FIFO actually done downloading" -- a fast sibling message must
+    not let it fire (and permanently lose a still-downloading attachment)
+    while local mode's FIFO still has unfinished work for the same chat."""
+
+    def test_flush_waits_for_a_slower_sibling_download_before_starting_a_turn(self):
+        bot = load_bot("http://127.0.0.1:8081/")
+        doc_started = threading.Event()
+        release_doc = threading.Event()
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+        launched = []
+
+        def fake_message_inputs(message):
+            if message["text"] == "doc":
+                doc_started.set()
+                self.assertTrue(release_doc.wait(2))
+            return ([{"type": "text", "text": message["text"]}], [], [])
+
+        def message(text, media=False):
+            result = {"chat": {"id": 1}, "from": {"id": 1}, "text": text}
+            if media:
+                result["document"] = {"file_id": text, "file_name": f"{text}.bin"}
+            return result
+
+        with patch.object(bot.threading, "Timer", FakeTimer), \
+                patch.object(bot, "run_turn", lambda *args: launched.append(args)), \
+                patch.object(bot, "message_inputs", side_effect=fake_message_inputs), \
+                patch.object(bot, "send_plain"), patch.object(bot, "tg_call", return_value={"ok": True}):
+            bot.handle_message(message("text"))
+            bot.handle_message(message("doc", media=True))
+            self.assertTrue(doc_started.wait(1))
+            # "text" already finished and scheduled the debounce timer;
+            # "doc" is still blocked downloading. Firing that timer now must
+            # NOT start a turn missing "doc" -- it must defer instead.
+            self.assertEqual(len(timers), 1)
+            timers[0].function()
+            self.assertEqual(launched, [])
+            self.assertGreaterEqual(len(timers), 2)
+            self.assertFalse(timers[-1].cancelled)
+
+            release_doc.set()
+            runtime = bot.get_tenant(1)
+            for _ in range(200):
+                if 1 not in bot.local_message_queues:
+                    break
+                threading.Event().wait(0.01)
+            self.assertNotIn(1, bot.local_message_queues)
+            # The retry timer scheduled after the deferred flush fires now,
+            # with both messages actually landed.
+            timers[-1].function()
+
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(
+            launched[0][1],
+            [
+                {"type": "text", "text": "text"},
+                {"type": "text", "text": "\n\n---\n\n"},
+                {"type": "text", "text": "doc"},
+            ],
+        )
+
+
 class GetFileErrorTests(unittest.TestCase):
     def test_cloud_get_file_too_big_description_has_cloud_guidance(self):
         bot = load_bot()
