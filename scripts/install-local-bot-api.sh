@@ -151,6 +151,7 @@ if unit_known; then
         else
             note "Telegram Bot API server already exists; nothing changed."
         fi
+        printf 'REUSE:existing\n'
         printf 'LOCAL_BOT_API_URL=http://127.0.0.1:%s\n' "$TELEGRAM_BOT_API_PORT"
         exit 0
     fi
@@ -167,6 +168,7 @@ while port_in_use "$TELEGRAM_BOT_API_PORT"; do
     [[ "$TELEGRAM_BOT_API_PORT" -le 65535 ]] || die "No free port found"
 done
 
+printf 'STAGE:dependencies\n'
 if "$DRY_RUN"; then
     if have_dependencies; then
         note "PLAN: dependencies are present."
@@ -176,10 +178,13 @@ if "$DRY_RUN"; then
         note "PLAN: would refuse until git, cmake, gperf, g++/make and OpenSSL/zlib development files are installed."
         exit 0
     fi
+    printf 'STAGE:build\n'
     note "PLAN: would build official telegram-bot-api at $TELEGRAM_BOT_API_REF in a temporary directory."
+    printf 'STAGE:install\n'
     note "PLAN: would install the binary to $TELEGRAM_BOT_API_BIN and create $TELEGRAM_BOT_API_ENV_FILE (mode 600) if absent."
     note "PLAN: would install ${TELEGRAM_BOT_API_UNIT}.service and its daily cleanup timer on port $TELEGRAM_BOT_API_PORT."
     printf 'LOCAL_BOT_API_URL=http://127.0.0.1:%s\n' "$TELEGRAM_BOT_API_PORT"
+    printf 'STAGE:done\n'
     exit 0
 fi
 
@@ -218,12 +223,14 @@ git clone --recursive https://github.com/tdlib/telegram-bot-api.git "$BUILD_ROOT
 git -C "$BUILD_ROOT/source" checkout --detach "$TELEGRAM_BOT_API_REF"
 git -C "$BUILD_ROOT/source" submodule update --init --recursive
 cmake -S "$BUILD_ROOT/source" -B "$BUILD_ROOT/build" -DCMAKE_BUILD_TYPE=Release
+printf 'STAGE:build\n'
 cmake --build "$BUILD_ROOT/build" --target telegram-bot-api -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 "$BUILD_ROOT/build/telegram-bot-api" --version >/dev/null
 mkdir -p "$(dirname "$TELEGRAM_BOT_API_BIN")"
 install -d -m 700 "$TELEGRAM_BOT_API_DIR" "$TELEGRAM_BOT_API_DIR/tmp"
 install -m 0755 "$BUILD_ROOT/build/telegram-bot-api" "$TELEGRAM_BOT_API_BIN"
 
+printf 'STAGE:install\n'
 write_unit "$SCRIPT_DIR/telegram-bot-api.service.example" "/etc/systemd/system/${TELEGRAM_BOT_API_UNIT}.service"
 write_unit "$SCRIPT_DIR/telegram-bot-api-cleanup.service.example" "/etc/systemd/system/${TELEGRAM_BOT_API_UNIT}-cleanup.service"
 write_unit "$SCRIPT_DIR/telegram-bot-api-cleanup.timer.example" "/etc/systemd/system/${TELEGRAM_BOT_API_UNIT}-cleanup.timer"
@@ -246,3 +253,4 @@ then
     die "Server did not answer. Inspect: journalctl -u ${TELEGRAM_BOT_API_UNIT}.service --no-pager"
 fi
 printf 'LOCAL_BOT_API_URL=http://127.0.0.1:%s\n' "$TELEGRAM_BOT_API_PORT"
+printf 'STAGE:done\n'

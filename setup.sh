@@ -48,23 +48,6 @@ if not result.get("ok"):
 print("Telegram bot token: valid (@%s)" % result["result"].get("username", "unknown"))
 PY
 }
-cloud_log_out() {
-    TELEGRAM_TOKEN_TO_LOG_OUT="$BOT_TOKEN" python3 - <<'PY'
-import json, os, urllib.request
-token = os.environ["TELEGRAM_TOKEN_TO_LOG_OUT"]
-request = urllib.request.Request(
-    f"https://api.telegram.org/bot{token}/logOut", data=b"", method="POST"
-)
-try:
-    with urllib.request.urlopen(request, timeout=15) as response:
-        result = json.load(response)
-except Exception as exc:
-    raise SystemExit(f"Cloud logOut failed: {exc}")
-if not result.get("ok"):
-    raise SystemExit("Cloud logOut was rejected by Telegram")
-PY
-}
-
 REINSTALL=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -182,16 +165,9 @@ if [[ -z "$TELEGRAM_API_URL" ]]; then
 fi
 
 if "$LOCAL_SWITCH_REQUIRED"; then
-    echo "Before switching, Telegram must log this bot out of the cloud API. This is one-way: the cloud API cannot be used again for about 10 minutes."
-    check_telegram_token ""
-    LOGOUT_CONFIRM="${LOCAL_BOT_API_LOGOUT_CONFIRM:-}"
-    if [[ -z "$LOGOUT_CONFIRM" && -t 0 ]]; then read -r -p "Call cloud logOut and switch to $TELEGRAM_API_URL? [y/N] " LOGOUT_CONFIRM; fi
-    if [[ ! -t 0 && "$LOGOUT_CONFIRM" != "yes" ]]; then
-        die "LOCAL_BOT_API_LOGOUT_CONFIRM=yes is required without a terminal before the irreversible cloud logOut step"
-    fi
-    [[ "$LOGOUT_CONFIRM" =~ ^[Yy]([Ee][Ss])?$|^yes$ ]] || die "Local switch cancelled before cloud logOut"
-    cloud_log_out
-    check_telegram_token "$TELEGRAM_API_URL"
+    SWITCHER="$SCRIPT_DIR/scripts/switch-to-local-bot-api.sh"
+    [[ -x "$SWITCHER" ]] || die "Local Bot API switcher is missing or not executable: $SWITCHER"
+    BOT_TOKEN="$BOT_TOKEN" "$SWITCHER" "$TELEGRAM_API_URL"
 fi
 
 umask 077

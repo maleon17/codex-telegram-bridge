@@ -4,8 +4,10 @@
 import json
 import mimetypes
 import os
+import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,7 @@ LOCAL_SEND_TIMEOUT_S = 600
 TELEGRAM_CLOUD_FILE_MAX_BYTES = 20 * 1024 * 1024
 IDLE_TIMEOUT_S = 300
 TOTAL_TIMEOUT_S = 1800
+LOCAL_BOT_API_STATUS_EDIT_MIN_INTERVAL_S = 1.0
 COMMANDS = [
     ("new", "Начать новую Codex-сессию"),
     ("sessions", "Список последних сессий"),
@@ -105,6 +108,14 @@ STATE_INSTANCE_NAME = STATE_FILE.stem
 RESTART_SIGNAL_FILE = Path(os.environ.get(
     "CODEX_BOT_RESTART_FILE", Path(__file__).with_name("restart.request")
 )).expanduser()
+BOT_ENV_FILE = Path(__file__).with_name(".env")
+TELEGRAM_BOT_API_UNIT = os.environ.get("TELEGRAM_BOT_API_UNIT", "telegram-bot-api")
+TELEGRAM_BOT_API_PORT = env_positive_int("TELEGRAM_BOT_API_PORT", 8081)
+TELEGRAM_BOT_API_ENV_FILE = Path(os.environ.get(
+    "TELEGRAM_BOT_API_ENV_FILE", "~/.config/telegram-bot-api/env"
+)).expanduser()
+LOCAL_BOT_API_INSTALL_SCRIPT = Path(__file__).parent / "scripts/install-local-bot-api.sh"
+LOCAL_BOT_API_SWITCH_SCRIPT = Path(__file__).parent / "scripts/switch-to-local-bot-api.sh"
 TELEGRAM_API_URL, LOCAL_BOT_API = telegram_api_config(os.environ.get("TELEGRAM_API_URL"))
 API_BASE = f"{TELEGRAM_API_URL}/bot{BOT_TOKEN}"
 FILE_API_BASE = f"{TELEGRAM_API_URL}/file/bot{BOT_TOKEN}"
@@ -204,6 +215,10 @@ class TenantRuntime:
         # the burst currently landing, handed to the next turn's TurnView so
         # it becomes the Thinking card in place instead of a second message.
         self.pending_progress_msg_id = None
+        # These values deliberately never enter state.json. In particular,
+        # api_hash is used in one call and never stored on this object.
+        self.update_flow_stage = None
+        self.update_flow_api_id = None
 
 
 tenants = {}
@@ -3188,6 +3203,298 @@ def account_is_ready(runtime):
         return False
 
 
+def _env_file_value(path, name):
+    """Read the last simple KEY=value entry without importing it into env."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        log(f"Could not read {path}: {exc}")
+        return ""
+    prefix = f"{name}="
+    values = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    return values[-1].strip() if values else ""
+
+
+def _configured_local_bot_api_url():
+    return _env_file_value(BOT_ENV_FILE, "TELEGRAM_API_URL")
+
+
+def _local_bot_api_dependencies_available():
+    """Keep --yes from making bot.py install packages through sudo."""
+    return (
+        all(shutil.which(name) for name in ("git", "cmake", "gperf", "g++", "make"))
+        and Path("/usr/include/openssl/ssl.h").is_file()
+        and Path("/usr/include/zlib.h").is_file()
+    )
+
+
+def _send_local_bot_api_status(chat_id, text):
+    result = tg_call("sendMessage", {"chat_id": chat_id, "text": text})
+    if result.get("ok"):
+        return (result.get("result") or {}).get("message_id")
+    return None
+
+
+def _update_local_bot_api_status(status, text, force=False):
+    now = time.monotonic()
+    if (not force and now - status.get("last_edit_at", 0.0)
+            < LOCAL_BOT_API_STATUS_EDIT_MIN_INTERVAL_S):
+        return
+    message_id = status.get("message_id")
+    if message_id is None:
+        status["message_id"] = _send_local_bot_api_status(status["chat_id"], text)
+    else:
+        edit_plain(status["chat_id"], message_id, text)
+    status["last_edit_at"] = now
+
+
+def _finish_local_bot_api_failure(runtime, status, details):
+    text = f"⚠️ Не удалось включить локальный сервер: {compact(details, 500)}"
+    try:
+        _update_local_bot_api_status(status, text, force=True)
+    except Exception as exc:
+        log(f"Could not report local Bot API failure: {exc}")
+    with process_lock:
+        runtime.update_flow_stage = None
+        runtime.update_flow_api_id = None
+    # This is only ever reached from the /update flow, after update.sh has
+    # already pulled new code -- a failed local-server switch must not also
+    # leave that update unapplied. .env is untouched on this path (still
+    # cloud mode, exactly as before), so restarting is safe either way.
+    send_plain(runtime.chat_id, "🔁 Перезапускаю бота, чтобы обновление вступило в силу…")
+    request_restart(OWNER_ID)
+
+
+def _write_telegram_api_url(url):
+    """Replace TELEGRAM_API_URL in the protected deployment .env file."""
+    if not BOT_ENV_FILE.exists():
+        raise RuntimeError(f"Не найден {BOT_ENV_FILE}")
+    if "\n" in url or "\r" in url:
+        raise RuntimeError("Установщик вернул недопустимый адрес локального сервера")
+    lines = BOT_ENV_FILE.read_text(encoding="utf-8").splitlines()
+    prefix = "TELEGRAM_API_URL="
+    lines = [line for line in lines if not line.startswith(prefix)]
+    lines.append(prefix + url)
+    old_umask = os.umask(0o077)
+    try:
+        # The file already exists and is mode 600; opening it this way does
+        # not alter its mode while the umask protects an unexpected create.
+        BOT_ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    finally:
+        os.umask(old_umask)
+
+
+def _run_local_bot_api_install(runtime, api_id=None, api_hash=None):
+    """Worker for the build/reuse and irreversible API endpoint switch."""
+    status = {
+        "chat_id": runtime.chat_id,
+        "message_id": None,
+        "last_edit_at": 0.0,
+    }
+    output_tail = deque(maxlen=20)
+    stage_text = {
+        "dependencies": "⏳ Проверяю зависимости сборки…",
+        "build": "⏳ Собираю локальный Bot API сервер (может занять ~15 минут)…",
+        "install": "⏳ Устанавливаю сервис…",
+        "done": "✅ Локальный сервер собран.",
+    }
+    try:
+        _update_local_bot_api_status(status, "⏳ Готовлю локальный Bot API сервер…", force=True)
+        env = dict(os.environ)
+        if api_id is not None:
+            env["TELEGRAM_API_ID"] = api_id
+        if api_hash is not None:
+            env["TELEGRAM_API_HASH"] = api_hash
+        process = subprocess.Popen(
+            [str(LOCAL_BOT_API_INSTALL_SCRIPT), "--yes"],
+            cwd=str(Path(__file__).parent), env=env, text=True, bufsize=1,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        # api_hash was supplied only to Popen's environment and is not kept
+        # on runtime (or any persistent state) after this point.
+        api_hash = None
+        local_url = None
+        for line in process.stdout:
+            line = line.rstrip("\n")
+            output_tail.append(line)
+            if line.startswith("STAGE:"):
+                stage = line[len("STAGE:"):]
+                if stage in stage_text:
+                    _update_local_bot_api_status(status, stage_text[stage], force=True)
+            elif line.startswith("REUSE:existing"):
+                _update_local_bot_api_status(
+                    status,
+                    "✅ Найден уже настроенный локальный сервер, пересобирать не нужно.",
+                    force=True,
+                )
+            elif line.startswith("LOCAL_BOT_API_URL="):
+                local_url = line[len("LOCAL_BOT_API_URL="):].strip()
+        exit_code = process.wait()
+        if exit_code != 0:
+            tail = "\n".join(output_tail)[-500:]
+            raise RuntimeError(tail or f"Установщик завершился с кодом {exit_code}")
+        if not local_url:
+            raise RuntimeError("Установщик не сообщил адрес локального сервера")
+        switch = subprocess.run(
+            [str(LOCAL_BOT_API_SWITCH_SCRIPT), local_url],
+            cwd=str(Path(__file__).parent),
+            env={**os.environ, "LOCAL_BOT_API_LOGOUT_CONFIRM": "yes"},
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if switch.returncode != 0:
+            raise RuntimeError((switch.stderr or switch.stdout or
+                                f"Переключатель завершился с кодом {switch.returncode}")[-500:])
+        _write_telegram_api_url(local_url)
+        _update_local_bot_api_status(status, "✅ Готово. Перезапускаю бота…", force=True)
+        request_restart(OWNER_ID)
+    except Exception as exc:
+        _finish_local_bot_api_failure(runtime, status, str(exc))
+
+
+def start_local_bot_api_install(runtime, api_id=None, api_hash=None):
+    """Start one installer worker, never a second concurrent installer."""
+    # install-local-bot-api.sh only ever builds from source when NO unit is
+    # registered yet (an existing one, even unhealthy, is left alone rather
+    # than rebuilt -- see repair_local_bot_api_service's own comment). Build
+    # tooling is therefore only actually needed in that one case; requiring
+    # it here too would block a plain reuse of an already-built shared
+    # server on a host that happens to be missing them.
+    if not _systemctl_unit_exists(TELEGRAM_BOT_API_UNIT) and not _local_bot_api_dependencies_available():
+        status = {"chat_id": runtime.chat_id, "message_id": None, "last_edit_at": 0.0}
+        _finish_local_bot_api_failure(
+            runtime, status,
+            "Не хватает зависимостей сборки. Прогони scripts/install-local-bot-api.sh из терминала вручную.",
+        )
+        return False
+    with process_lock:
+        if runtime.update_flow_stage == "installing":
+            return False
+        runtime.update_flow_stage = "installing"
+    threading.Thread(
+        target=_run_local_bot_api_install,
+        args=(runtime, api_id, api_hash), daemon=True,
+    ).start()
+    return True
+
+
+def _systemctl_is_active(unit):
+    try:
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", f"{unit}.service"],
+            capture_output=True, text=True, timeout=15, check=False,
+        ).returncode == 0
+    except OSError as exc:
+        log(f"Could not check {unit}.service: {exc}")
+        return False
+
+
+def _systemctl_unit_exists(unit):
+    try:
+        result = subprocess.run(
+            ["systemctl", "list-unit-files", f"{unit}.service", "--no-legend"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        return bool((result.stdout or "").strip())
+    except OSError as exc:
+        log(f"Could not list {unit}.service: {exc}")
+        return False
+
+
+def _local_bot_api_port_ready():
+    try:
+        with socket.create_connection(("127.0.0.1", TELEGRAM_BOT_API_PORT), timeout=5):
+            return True
+    except OSError:
+        return False
+
+
+def repair_local_bot_api_service():
+    """Repair only an existing configured unit; never install one from bot.py."""
+    unit = TELEGRAM_BOT_API_UNIT
+    if _systemctl_is_active(unit):
+        return None
+    if not _systemctl_unit_exists(unit):
+        return ("⚠️ Локальный сервер сконфигурирован, но не установлен на этом хосте — "
+                "прогони scripts/install-local-bot-api.sh из терминала вручную.")
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "systemctl", "restart", f"{unit}.service"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except OSError as exc:
+        return f"⚠️ Не смог перезапустить локальный сервер: {compact(str(exc), 300)}"
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        permission_markers = (
+            "password is required", "a password is required", "not allowed to run sudo",
+            "no tty present", "permission denied",
+        )
+        if any(marker in details.lower() for marker in permission_markers):
+            return "⚠️ Нет прав перезапустить сервер, нужен sudoers-грант."
+        return f"⚠️ Не смог перезапустить локальный сервер: {compact(details, 300)}"
+    time.sleep(2)
+    if _systemctl_is_active(unit) and _local_bot_api_port_ready():
+        return "🔧 Локальный сервер был неактивен, перезапустил."
+    return "⚠️ Не смог перезапустить локальный сервер: сервис или его порт не стал активен."
+
+
+def handle_update_flow_message(chat_id, text, runtime):
+    """Consume owner-only local-Bot-API setup replies before Codex sees them."""
+    if chat_id != OWNER_ID:
+        return False
+    with process_lock:
+        stage = runtime.update_flow_stage
+    if stage is None:
+        return False
+    if stage == "installing":
+        command = text.split(None, 1)[0].split("@", 1)[0].lower() if text else ""
+        if command == "/update":
+            send_plain(chat_id, "Установка уже идёт, дождись.")
+        return True
+    if stage == "awaiting_yes_no":
+        answer = text.strip().lower()
+        if answer in ("да", "yes", "ага"):
+            if TELEGRAM_BOT_API_ENV_FILE.exists():
+                start_local_bot_api_install(runtime)
+            else:
+                with process_lock:
+                    runtime.update_flow_stage = "awaiting_api_id"
+                send_plain(chat_id, "Пришли api_id")
+            return True
+        with process_lock:
+            runtime.update_flow_stage = None
+            runtime.update_flow_api_id = None
+        # The code update.sh already pulled is still waiting to be applied --
+        # declining the local-server offer must not silently swallow that,
+        # the same restart /update always does when nothing local-bot-api-
+        # related comes up at all.
+        send_plain(chat_id, "Ладно. 🔁 Перезапускаю бота, чтобы обновление вступило в силу…")
+        request_restart(chat_id)
+        return True
+    if stage == "awaiting_api_id":
+        if not re.fullmatch(r"[0-9]+", text.strip()):
+            send_plain(chat_id, "Пришли api_id")
+            return True
+        with process_lock:
+            runtime.update_flow_api_id = text.strip()
+            runtime.update_flow_stage = "awaiting_api_hash"
+        send_plain(chat_id, "Пришли api_hash")
+        return True
+    if stage == "awaiting_api_hash":
+        api_hash = text.strip()
+        if not api_hash:
+            send_plain(chat_id, "Пришли api_hash")
+            return True
+        with process_lock:
+            api_id = runtime.update_flow_api_id
+            runtime.update_flow_api_id = None
+        start_local_bot_api_install(runtime, api_id=api_id, api_hash=api_hash)
+        return True
+    return False
+
+
 def handle_command(chat_id, command, runtime=None):
     runtime = runtime or get_tenant(chat_id)
     state_key = runtime.state_key
@@ -3371,6 +3678,12 @@ def handle_command(chat_id, command, runtime=None):
         if chat_id != OWNER_ID:
             send_plain(chat_id, "Обновление доступно только владельцу бота.")
             return True
+        # /update configures the owner's shared local server, never a
+        # currently selected delegated tenant.
+        runtime = get_tenant(OWNER_ID)
+        if runtime.update_flow_stage == "installing":
+            send_plain(chat_id, "Установка уже идёт, дождись.")
+            return True
         cancel_pending_batch(runtime)
         send_plain(chat_id, "⬇️ Обновляю из git...")
         script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.sh")
@@ -3390,11 +3703,29 @@ def handle_command(chat_id, command, runtime=None):
             (line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()),
             "Обновление завершено.",
         )
+        configured_url = _configured_local_bot_api_url()
+        if not configured_url:
+            with process_lock:
+                runtime.update_flow_stage = "awaiting_yes_no"
+                runtime.update_flow_api_id = None
+            send_plain(chat_id, f"✅ {summary}")
+            send_plain(
+                chat_id,
+                "Включить приём файлов до 2 ГБ через локальный Bot API сервер? "
+                "Ответь Да или Нет.",
+            )
+            # The install itself only starts once the owner actually answers
+            # "да" -- see handle_update_flow_message. Asking here and then
+            # starting anyway regardless of the answer would defeat the
+            # entire point of asking.
+            return True
+        repair_status = repair_local_bot_api_service()
         request_restart(chat_id)
+        suffix = f"\n{repair_status}" if repair_status else ""
         if runtime.busy or runtime.pending_batch:
-            send_plain(chat_id, f"✅ {summary}\n🔁 Перезапуск запланирован после завершения текущего хода.")
+            send_plain(chat_id, f"✅ {summary}{suffix}\n🔁 Перезапуск запланирован после завершения текущего хода.")
         else:
-            send_plain(chat_id, f"✅ {summary}\n🔁 Перезапуск запланирован между ходами.")
+            send_plain(chat_id, f"✅ {summary}{suffix}\n🔁 Перезапуск запланирован между ходами.")
         return True
     if cmd == "stop":
         cancel_pending_batch(runtime)
@@ -3572,6 +3903,10 @@ def handle_message(message):
         draining = restart_draining
     if draining:
         send_plain(chat_id, "🔄 Уже начинаю перезапуск; сообщение пока не принято.")
+        return
+    # This is deliberately before command/Codex routing: API credentials and
+    # setup replies must never become a Codex turn or persistent chat state.
+    if handle_update_flow_message(chat_id, text, owner_runtime):
         return
     # A forwarded message is data, not a command.  Otherwise forwarding a
     # message beginning with /new or /stop would execute that command instead
