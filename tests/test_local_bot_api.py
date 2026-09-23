@@ -203,6 +203,99 @@ class LocalMessageOrderingTests(unittest.TestCase):
         self.assertEqual(queued, ["second", "third"])
 
 
+class DownloadStatusTests(unittest.TestCase):
+    """A slow local-mode download must not leave the chat silent -- see
+    the standing bug report: no feedback at all while a large file's
+    getFile blocks, easily minutes for a big upload."""
+
+    def test_status_message_is_visible_while_download_is_still_running(self):
+        bot = load_bot("http://127.0.0.1:8081/")
+        download_started = threading.Event()
+        release_download = threading.Event()
+        calls = []
+
+        def fake_tg_call(method, params=None, **_kwargs):
+            calls.append((method, dict(params or {})))
+            if method == "sendMessage":
+                return {"ok": True, "result": {"message_id": 42}}
+            return {"ok": True}
+
+        def fake_message_inputs(message):
+            download_started.set()
+            self.assertTrue(release_download.wait(2))
+            return ([{"type": "text", "text": message["text"]}], [], [])
+
+        def message(text):
+            return {"chat": {"id": 1}, "from": {"id": 1}, "text": text,
+                    "document": {"file_id": text, "file_name": f"{text}.bin"}}
+
+        with patch.object(bot, "tg_call", side_effect=fake_tg_call), \
+                patch.object(bot, "message_inputs", side_effect=fake_message_inputs), \
+                patch.object(bot, "queue_message"), patch.object(bot, "send_plain"):
+            bot.handle_message(message("big"))
+            self.assertTrue(download_started.wait(1))
+            # The status message must already be on the wire WHILE the
+            # download is still blocked -- not only after it finishes.
+            sent = [c for c in calls if c[0] == "sendMessage"]
+            self.assertEqual(len(sent), 1)
+            self.assertIn("Загружаю", sent[0][1]["text"])
+            release_download.set()
+            for _ in range(200):
+                if bot.local_message_queues == {}:
+                    break
+                threading.Event().wait(0.01)
+        edits = [c for c in calls if c[0] == "editMessageText"]
+        self.assertTrue(edits, "the status bubble must be updated once the download finishes")
+        self.assertEqual(edits[-1][1]["message_id"], 42)
+
+    def test_status_message_counts_files_queued_during_a_slow_download(self):
+        bot = load_bot("http://127.0.0.1:8081/")
+        first_started = threading.Event()
+        second_queued = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def fake_tg_call(method, params=None, **_kwargs):
+            calls.append((method, dict(params or {})))
+            if method == "sendMessage":
+                return {"ok": True, "result": {"message_id": 7}}
+            return {"ok": True}
+
+        def fake_message_inputs(message):
+            if message["text"] == "first":
+                first_started.set()
+                self.assertTrue(second_queued.wait(2))
+                self.assertTrue(release_first.wait(2))
+            return ([{"type": "text", "text": message["text"]}], [], [])
+
+        def message(text):
+            return {"chat": {"id": 1}, "from": {"id": 1}, "text": text,
+                    "document": {"file_id": text, "file_name": f"{text}.bin"}}
+
+        with patch.object(bot, "tg_call", side_effect=fake_tg_call), \
+                patch.object(bot, "message_inputs", side_effect=fake_message_inputs), \
+                patch.object(bot, "queue_message"), patch.object(bot, "send_plain"):
+            bot.handle_message(message("first"))
+            self.assertTrue(first_started.wait(1))
+            sent = [c for c in calls if c[0] == "sendMessage"]
+            self.assertEqual(len(sent), 1)
+            self.assertNotIn("/", sent[0][1]["text"])  # only one file known yet
+            bot.handle_message(message("second"))
+            second_queued.set()
+            # A second file queuing up mid-download must refresh the count
+            # immediately, not wait for "first" to finish.
+            edits = [c for c in calls if c[0] == "editMessageText"]
+            self.assertTrue(edits)
+            self.assertIn("(0/2)", edits[-1][1]["text"])
+            release_first.set()
+            for _ in range(200):
+                if bot.local_message_queues == {}:
+                    break
+                threading.Event().wait(0.01)
+        edits = [c[1]["text"] for c in calls if c[0] == "editMessageText"]
+        self.assertIn("(2/2)", edits[-1])
+
+
 class GetFileErrorTests(unittest.TestCase):
     def test_cloud_get_file_too_big_description_has_cloud_guidance(self):
         bot = load_bot()

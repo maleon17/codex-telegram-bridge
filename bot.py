@@ -3405,6 +3405,42 @@ def process_message_inputs(runtime, message):
         queue_message(runtime, inputs, media_paths)
 
 
+# Fields message_inputs() actually downloads. has_media (used for command
+# routing) is broader -- video/animation/sticker/video_note never reach
+# download_telegram_file, so counting them here would promise a download
+# status update that never arrives.
+DOWNLOADED_MEDIA_FIELDS = ("photo", "document", "voice", "audio")
+DOWNLOAD_STATUS_EDIT_MIN_INTERVAL_S = 1.0
+
+
+def _has_downloadable_media(message):
+    return any(message.get(field) for field in DOWNLOADED_MEDIA_FIELDS)
+
+
+def _update_download_status(queue_state, chat_id, force=False):
+    """Best-effort progress line for a local-mode download in progress.
+
+    Not a percentage -- the local Bot API server gives no progress signal
+    for an in-flight getFile, only "done" once it has the whole file. Count
+    of files finished vs. known-queued is the honest signal we actually have.
+    """
+    total = queue_state["total"]
+    done = queue_state["done"]
+    text = f"📥 Загружаю вложение ({done}/{total})…" if total > 1 else "📥 Загружаю вложение…"
+    now = time.monotonic()
+    msg_id = queue_state["status_msg_id"]
+    if msg_id is None:
+        result = tg_call("sendMessage", {"chat_id": chat_id, "text": text})
+        if result.get("ok"):
+            queue_state["status_msg_id"] = (result.get("result") or {}).get("message_id")
+            queue_state["status_last_edit_at"] = now
+        return
+    if not force and now - queue_state.get("status_last_edit_at", 0.0) < DOWNLOAD_STATUS_EDIT_MIN_INTERVAL_S:
+        return
+    tg_call("editMessageText", {"chat_id": chat_id, "message_id": msg_id, "text": text})
+    queue_state["status_last_edit_at"] = now
+
+
 def _process_local_message_queue(chat_id):
     """Process one chat's local-Bot-API updates in their arrival order."""
     while True:
@@ -3414,6 +3450,12 @@ def _process_local_message_queue(chat_id):
                 local_message_queues.pop(chat_id, None)
                 return
             runtime, message = queue_state["messages"].popleft()
+        has_media = _has_downloadable_media(message)
+        if has_media:
+            try:
+                _update_download_status(queue_state, chat_id)
+            except Exception as exc:
+                log(f"chat={chat_id} download status update failed: {exc}")
         try:
             process_message_inputs(runtime, message)
         except Exception as exc:
@@ -3421,21 +3463,54 @@ def _process_local_message_queue(chat_id):
             # this last guard ensures an unexpected failure cannot strand a
             # chat's later updates behind this worker.
             log(f"chat={chat_id} local message worker failed: {exc}")
+        if has_media:
+            with process_lock:
+                queue_state["done"] += 1
+                just_completed = queue_state["done"] >= queue_state["total"]
+            try:
+                # force=True when this looks like the last outstanding file:
+                # a fast download can finish inside the throttle window of
+                # its own "starting" update, which would otherwise leave the
+                # bubble stuck on a stale count with nothing left to fire a
+                # later edit. If another file arrives after all, its own
+                # "starting" update naturally supersedes this one.
+                _update_download_status(queue_state, chat_id, force=just_completed)
+            except Exception as exc:
+                log(f"chat={chat_id} download status update failed: {exc}")
 
 
 def queue_local_message(runtime, message):
     """Append a local-mode update and ensure its per-chat FIFO worker runs."""
     chat_id = runtime.chat_id
     start_worker = False
+    has_media = _has_downloadable_media(message)
     with process_lock:
         queue_state = local_message_queues.get(chat_id)
         if queue_state is None:
-            queue_state = {"messages": deque(), "running": False}
+            queue_state = {
+                "messages": deque(), "running": False,
+                "status_msg_id": None, "status_last_edit_at": 0.0,
+                "total": 0, "done": 0,
+            }
             local_message_queues[chat_id] = queue_state
         queue_state["messages"].append((runtime, message))
+        if has_media:
+            queue_state["total"] += 1
+        already_showing = queue_state["status_msg_id"] is not None
         if not queue_state["running"]:
             queue_state["running"] = True
             start_worker = True
+    if has_media and already_showing:
+        # A download is already visibly in progress for this chat; refresh
+        # its count now instead of waiting for the current file to finish,
+        # so the bubble doesn't sit on a stale total while more files queue
+        # up behind it. force=True: a new file arriving is discrete, useful
+        # information, not a repetitive tick the throttle is meant to guard
+        # against.
+        try:
+            _update_download_status(queue_state, chat_id, force=True)
+        except Exception as exc:
+            log(f"chat={chat_id} download status update failed: {exc}")
     if start_worker:
         threading.Thread(
             target=_process_local_message_queue, args=(chat_id,), daemon=True,
