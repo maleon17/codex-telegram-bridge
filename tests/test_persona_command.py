@@ -44,6 +44,10 @@ class PersonaCommandTests(unittest.TestCase):
             "[mcp_servers.owner_marker]\ncommand = \"marker\"\n", encoding="utf-8"
         )
         (self.source_home / "auth.json").write_text("auth", encoding="utf-8")
+        (self.source_home / "sessions" / "2026" / "09" / "25").mkdir(parents=True)
+        (self.source_home / "sessions" / "2026" / "09" / "25" / "legacy.jsonl").write_text(
+            "legacy rollout\n", encoding="utf-8"
+        )
 
     def _seed_mcp(self, tenant_dir, chat_id):
         config = tenant_dir / "config.toml"
@@ -67,6 +71,15 @@ class PersonaCommandTests(unittest.TestCase):
             self.assertIn("delegate-to-claude", config)
             self.assertIn("send-telegram-file", config)
             self.assertTrue((owner_dir / "auth.json").is_symlink())
+            migrated = owner_dir / "sessions" / "2026" / "09" / "25" / "legacy.jsonl"
+            self.assertEqual(migrated.read_text(encoding="utf-8"), "legacy rollout\n")
+            (self.source_home / "sessions" / "2026" / "09" / "25" / "later.jsonl").write_text(
+                "must not overwrite the tenant copy\n", encoding="utf-8"
+            )
+            bot.tenant_codex_home(bot.OWNER_ID)
+            self.assertFalse(
+                (owner_dir / "sessions" / "2026" / "09" / "25" / "later.jsonl").exists()
+            )
             self.assertEqual((owner_dir / "auth.json").resolve(), self.source_home / "auth.json")
 
         sent, documents = [], []

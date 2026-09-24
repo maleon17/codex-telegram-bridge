@@ -344,6 +344,21 @@ def _ensure_tenant_file_send_instructions(agents_path):
     )
 
 
+def _migrate_owner_sessions(owner_dir):
+    """Copy legacy Codex session rollouts once into the owner's tenant home.
+
+    /resume references rollout files below ``$CODEX_HOME/sessions``. Moving
+    only auth/config/AGENTS.md makes every existing thread id unresumable
+    once this bot starts passing a tenant ``CODEX_HOME``. Preserve the
+    legacy source and never overwrite a tenant sessions directory that has
+    already been created.
+    """
+    source = default_codex_home() / "sessions"
+    destination = owner_dir / "sessions"
+    if source.is_dir() and not destination.exists():
+        shutil.copytree(source, destination, copy_function=shutil.copy2)
+
+
 def tenant_codex_home(chat_id, state_key=None):
     """Return a tenant home; delegates share auth/config, not session files."""
     chat_id = int(chat_id)
@@ -394,6 +409,7 @@ def tenant_codex_home(chat_id, state_key=None):
             link.unlink()
         if not link.is_symlink():
             link.symlink_to(target)
+        _migrate_owner_sessions(path)
     # Idempotent (marker-guarded, append-only if missing) for everyone,
     # owner included -- without it, the owner's migrated AGENTS.md has no
     # working knowledge of the send-telegram-file MCP tool it was just
