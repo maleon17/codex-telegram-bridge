@@ -50,6 +50,7 @@ COMMANDS = [
     ("workspace", "Рабочая директория"),
     ("account", "Состояние аккаунта Codex"),
     ("login", "Подключить свой аккаунт Codex"),
+    ("persona", "Показать или сбросить персону владельца"),
     ("restart", "Перезапустить Codex-бота"),
     ("update", "Обновить бота из git и перезапустить"),
 ]
@@ -227,6 +228,9 @@ tenants_delegate = {}
 # Each chat gets its own worker so that later updates cannot overtake that
 # download, while independent chats continue immediately.
 local_message_queues = {}
+# chat_id -> message ids produced by /persona.  This is not a conversational
+# stage: a reply remains valid whenever it references one of these snapshots.
+persona_message_ids = {}
 
 
 def get_tenant(chat_id):
@@ -347,7 +351,7 @@ def tenant_codex_home(chat_id, state_key=None):
     if delegated:
         path = ACCOUNTS_DIR / "delegated" / str(chat_id)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        shared_home = tenant_codex_home(chat_id) or default_codex_home()
+        shared_home = tenant_codex_home(chat_id)
         # Only these two files are shared. Sessions and every other file stay
         # physically inside the delegated home above.
         for filename in ("auth.json", "config.toml"):
@@ -361,14 +365,39 @@ def tenant_codex_home(chat_id, state_key=None):
                 link.unlink()
             link.symlink_to(target)
         return path
-    if chat_id == OWNER_ID:
-        return None
     path = ACCOUNTS_DIR / str(chat_id)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     agents_path = path / "AGENTS.md"
+    owner = chat_id == OWNER_ID
     if not agents_path.exists():
-        shutil.copyfile(Path(__file__).with_name("personality.example.md"), agents_path)
-        shutil.copyfile(Path(__file__).with_name("HANDOFF.md"), path / "handoff.md")
+        persona_source = (
+            default_codex_home() / "AGENTS.md"
+            if owner else Path(__file__).with_name("personality.example.md")
+        )
+        if persona_source.exists():
+            shutil.copyfile(persona_source, agents_path)
+        else:
+            agents_path.touch(mode=0o600)
+        if owner:
+            source_config = default_codex_home() / "config.toml"
+            if source_config.exists():
+                shutil.copyfile(source_config, path / "config.toml")
+        else:
+            shutil.copyfile(Path(__file__).with_name("HANDOFF.md"), path / "handoff.md")
+    if owner:
+        link = path / "auth.json"
+        target = (default_codex_home() / "auth.json").absolute()
+        if link.is_symlink():
+            if os.path.realpath(link) != os.path.realpath(target):
+                link.unlink()
+        elif link.exists():
+            link.unlink()
+        if not link.is_symlink():
+            link.symlink_to(target)
+    # Idempotent (marker-guarded, append-only if missing) for everyone,
+    # owner included -- without it, the owner's migrated AGENTS.md has no
+    # working knowledge of the send-telegram-file MCP tool it was just
+    # given access to. This does not touch the rest of a /persona rewrite.
     _ensure_tenant_file_send_instructions(agents_path)
     try:
         _ensure_tenant_mcp_config(path, chat_id)
@@ -1472,6 +1501,95 @@ def send_document(chat_id, path, caption=""):
                 rate_limit_until = max(rate_limit_until, time.monotonic() + delay)
         log(f"Telegram sendDocument not ok: {result}")
     return result
+
+
+def _persona_path(chat_id):
+    return tenant_codex_home(chat_id) / "AGENTS.md"
+
+
+def _write_persona(path, contents):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=".persona.", dir=path.parent, text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _remember_persona_message(chat_id, result):
+    if result.get("ok"):
+        message_id = (result.get("result") or {}).get("message_id")
+        if isinstance(message_id, int):
+            persona_message_ids.setdefault(int(chat_id), set()).add(message_id)
+
+
+def send_persona(chat_id):
+    """Send a one-message persona snapshot, or a Markdown document if needed."""
+    contents = _persona_path(chat_id).read_text(encoding="utf-8")
+    if len(contents) <= MAX_MESSAGE_LEN:
+        result = send_plain(chat_id, contents)
+    else:
+        fd, temporary = tempfile.mkstemp(prefix="persona-", suffix=".md", text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(contents)
+            result = send_document(chat_id, temporary, caption="Текущая персона")
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    _remember_persona_message(chat_id, result)
+    return result
+
+
+def handle_persona_reply(message):
+    """Consume a reply to a /persona snapshot before normal Codex routing."""
+    chat_id = message.get("chat", {}).get("id")
+    if chat_id != OWNER_ID:
+        return False
+    reply = message.get("reply_to_message") or {}
+    reply_id = reply.get("message_id") or message.get("reply_to_message_id")
+    if reply_id not in persona_message_ids.get(chat_id, set()):
+        return False
+    document = message.get("document") or {}
+    if document:
+        try:
+            local_path = download_telegram_file(
+                document["file_id"], document.get("file_name") or "persona.md",
+                chat_id=chat_id, file_size=document.get("file_size"),
+            )
+            contents = Path(local_path).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            send_plain(chat_id, "Файл персоны должен быть текстовым UTF-8 Markdown-файлом.")
+            return True
+        except Exception as exc:
+            send_plain(chat_id, f"Не удалось прочитать файл персоны: {compact(str(exc), 500)}")
+            return True
+    else:
+        contents = message.get("text")
+        if not isinstance(contents, str):
+            send_plain(chat_id, "Пришли текст персоны или UTF-8 Markdown-файл ответом на сообщение.")
+            return True
+    if not contents.strip():
+        send_plain(chat_id, "Пустая персона не сохранена.")
+        return True
+    _write_persona(_persona_path(chat_id), contents)
+    send_plain(chat_id, "✅ Персона обновлена.")
+    return True
 
 
 def send_photo(chat_id, path, caption=""):
@@ -3504,6 +3622,21 @@ def handle_command(chat_id, command, runtime=None):
     if cmd in ("start", "help"):
         send_plain(chat_id, "Codex Telegram bridge. Команды доступны в меню бота.")
         return True
+    if cmd == "persona":
+        if chat_id != OWNER_ID:
+            send_plain(chat_id, "Персона доступна только владельцу в личном чате.")
+            return True
+        if arg.lower() == "reset":
+            _write_persona(
+                _persona_path(chat_id),
+                Path(__file__).with_name("personality.example.md").read_text(encoding="utf-8"),
+            )
+            send_plain(chat_id, "✅ Персона сброшена к шаблону по умолчанию.")
+        elif arg:
+            send_plain(chat_id, "Использование: /persona или /persona reset")
+        else:
+            send_persona(chat_id)
+        return True
     if cmd == "login":
         threading.Thread(target=start_account_login, args=(runtime,), daemon=True).start()
         return True
@@ -3904,6 +4037,11 @@ def handle_message(message):
     if draining:
         send_plain(chat_id, "🔄 Уже начинаю перезапуск; сообщение пока не принято.")
         return
+    # A reply target, rather than message ordering, authorizes persona edits.
+    # Handle it before update/command/Codex routing so the content is never a
+    # prompt or an update-flow credential.
+    if handle_persona_reply(message):
+        return
     # This is deliberately before command/Codex routing: API credentials and
     # setup replies must never become a Codex turn or persistent chat state.
     if handle_update_flow_message(chat_id, text, owner_runtime):
@@ -3958,7 +4096,7 @@ def main():
     offset = None
     register_commands()
     try:
-        _ensure_tenant_mcp_config(default_codex_home(), OWNER_ID)
+        _ensure_tenant_mcp_config(tenant_codex_home(OWNER_ID), OWNER_ID)
     except Exception as exc:
         log(f"owner could not seed tenant MCP servers: {exc}")
     with state_lock:
