@@ -379,26 +379,29 @@ class RuntimeIsolationTests(unittest.TestCase):
             root = Path(temp_dir)
             shared_home = root / "shared"
             shared_home.mkdir()
-            for filename in ("auth.json", "config.toml"):
-                (shared_home / filename).write_text(filename, encoding="utf-8")
+            (shared_home / "auth.json").write_text("auth", encoding="utf-8")
+            (shared_home / "config.toml").write_text('model = "test"\n', encoding="utf-8")
             accounts_dir = root / "accounts"
             runtime = bot.TenantRuntime(
                 bot.OWNER_ID, state_key=bot.delegate_key(bot.OWNER_ID),
             )
             with patch.object(bot, "ACCOUNTS_DIR", accounts_dir), \
-                    patch.dict(os.environ, {"CODEX_HOME": str(shared_home)}, clear=False):
+                    patch.dict(os.environ, {"CODEX_HOME": str(shared_home)}, clear=False), \
+                    patch.object(bot, "_ensure_tenant_mcp_config"):
                 delegate_home = bot.tenant_codex_home(
                     runtime.chat_id, state_key=runtime.state_key,
                 )
                 self.assertNotEqual(delegate_home, shared_home)
+                owner_home = bot.tenant_codex_home(bot.OWNER_ID)
+                self.assertEqual(owner_home, accounts_dir / str(bot.OWNER_ID))
                 for filename in ("auth.json", "config.toml"):
                     link = delegate_home / filename
                     self.assertTrue(link.is_symlink())
-                    self.assertEqual(link.resolve(), shared_home / filename)
+                    self.assertEqual(link.readlink(), owner_home / filename)
 
-                (shared_home / "sessions").mkdir()
+                (owner_home / "sessions").mkdir()
                 (delegate_home / "sessions").mkdir()
-                owner_session = shared_home / "sessions" / "owner.jsonl"
+                owner_session = owner_home / "sessions" / "owner.jsonl"
                 delegate_session = delegate_home / "sessions" / "delegate.jsonl"
                 owner_session.write_text("", encoding="utf-8")
                 delegate_session.write_text("", encoding="utf-8")
