@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from app_server import AppServerClient, AppServerError
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
+from strings import t
 
 
 EDIT_THROTTLE_S = 1.3
@@ -510,45 +511,25 @@ class AttachmentDownloadError(UnsupportedAttachmentError):
 
 def _download_error_from_exception(exc):
     if isinstance(exc, TimeoutError):
-        return AttachmentDownloadError(
-            "timeout", "Файл не скачан: Telegram слишком долго готовил файл. Попробуй ещё раз или дай ссылку."
-        )
+        return AttachmentDownloadError("timeout", t("attachment_timeout"))
     if isinstance(exc, PermissionError):
-        return AttachmentDownloadError(
-            "local_file_access", "Файл не скачан: нет доступа к файлу локального Bot API. Проверь права сервера и бота."
-        )
+        return AttachmentDownloadError("local_file_access", t("attachment_local_file_access"))
     if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
-        return AttachmentDownloadError(
-            "no_space", "Файл не скачан: на диске нет места. Освободи место и отправь файл снова."
-        )
+        return AttachmentDownloadError("no_space", t("attachment_no_space"))
     if isinstance(exc, (urllib.error.URLError, ConnectionError, OSError)):
-        return AttachmentDownloadError(
-            "network", "Файл не скачан: ошибка связи с Telegram. Попробуй ещё раз или дай ссылку."
-        )
-    return AttachmentDownloadError(
-        "download_failed", "Файл не скачан: Telegram не дал получить файл. Попробуй ещё раз или дай ссылку."
-    )
+        return AttachmentDownloadError("network", t("attachment_network"))
+    return AttachmentDownloadError("download_failed", t("attachment_download_failed"))
 
 
 def _get_file_error(result):
     detail = str(result.get("error") or result.get("description") or "").lower()
     if not LOCAL_BOT_API and "file is too big" in detail:
-        return AttachmentDownloadError(
-            "too_big_for_cloud",
-            "Файл не скачан: размер файла превышает облачный лимит Telegram 20 МБ. "
-            "Включи локальный Bot API сервер в setup.sh или дай ссылку.",
-        )
+        return AttachmentDownloadError("too_big_for_cloud", t("attachment_too_big_for_cloud"))
     if "timed out" in detail or "timeout" in detail:
-        return AttachmentDownloadError(
-            "timeout", "Файл не скачан: Telegram слишком долго готовил файл. Попробуй ещё раз или дай ссылку."
-        )
+        return AttachmentDownloadError("timeout", t("attachment_timeout"))
     if result.get("error"):
-        return AttachmentDownloadError(
-            "network", "Файл не скачан: ошибка связи с Telegram. Попробуй ещё раз или дай ссылку."
-        )
-    return AttachmentDownloadError(
-        "get_file_failed", "Файл не скачан: Telegram отказал в выдаче файла. Отправь его снова или дай ссылку."
-    )
+        return AttachmentDownloadError("network", t("attachment_network"))
+    return AttachmentDownloadError("get_file_failed", t("attachment_get_file_failed"))
 
 
 def download_telegram_file(file_id, suggested_name="image.jpg", chat_id=None,
@@ -558,18 +539,14 @@ def download_telegram_file(file_id, suggested_name="image.jpg", chat_id=None,
         size_mb = file_size / (1024 * 1024)
         raise AttachmentDownloadError(
             "too_big_for_cloud",
-            "Файл не скачан: размер "
-            f"{size_mb:.1f} МБ превышает облачный лимит Telegram 20 МБ. "
-            "Включи локальный Bot API сервер в setup.sh или дай ссылку.",
+            t("attachment_too_big_for_cloud_sized", size_mb=f"{size_mb:.1f}"),
         )
     result = tg_call("getFile", {"file_id": file_id}, timeout=GET_FILE_TIMEOUT_S)
     if not result.get("ok"):
         raise _get_file_error(result)
     remote_path = (result.get("result") or {}).get("file_path") if result.get("ok") else None
     if not remote_path:
-        raise AttachmentDownloadError(
-            "get_file_failed", "Файл не скачан: Telegram не вернул путь к файлу. Попробуй ещё раз или дай ссылку."
-        )
+        raise AttachmentDownloadError("get_file_failed", t("attachment_no_file_path"))
     suffix = Path(suggested_name).suffix or Path(remote_path).suffix or ".jpg"
     media_dir = tenant_upload_dir(chat_id) if chat_id is not None else (
         Path(tempfile.gettempdir()) / "codex-telegram-bot-media"
@@ -584,24 +561,13 @@ def download_telegram_file(file_id, suggested_name="image.jpg", chat_id=None,
             try:
                 source_stat = source.stat()
             except FileNotFoundError:
-                raise AttachmentDownloadError(
-                    "local_file_missing",
-                    "Файл не скачан: локальный Bot API больше не видит этот файл. Отправь его снова или дай ссылку.",
-                )
+                raise AttachmentDownloadError("local_file_missing", t("attachment_local_file_missing"))
             except PermissionError:
-                raise AttachmentDownloadError(
-                    "local_file_access",
-                    "Файл не скачан: нет доступа к файлу локального Bot API. Проверь права сервера и бота.",
-                )
+                raise AttachmentDownloadError("local_file_access", t("attachment_local_file_access"))
             if not source.is_file():
-                raise AttachmentDownloadError(
-                    "local_file_access",
-                    "Файл не скачан: путь локального Bot API не является доступным файлом. Проверь права сервера и бота.",
-                )
+                raise AttachmentDownloadError("local_file_access", t("attachment_local_file_not_a_file"))
             if source_stat.st_size > max_bytes:
-                raise AttachmentDownloadError(
-                    "too_big", "Файл не скачан: размер превышает разрешённый лимит. Отправь меньший файл или дай ссылку."
-                )
+                raise AttachmentDownloadError("too_big", t("attachment_too_big"))
             shutil.move(str(source), local_path)
             return local_path
         with urllib.request.urlopen(
@@ -613,9 +579,7 @@ def download_telegram_file(file_id, suggested_name="image.jpg", chat_id=None,
                 if not chunk:
                     break
                 if handle.tell() + len(chunk) > max_bytes:
-                    raise AttachmentDownloadError(
-                        "too_big", "Файл не скачан: размер превышает разрешённый лимит. Отправь меньший файл или дай ссылку."
-                    )
+                    raise AttachmentDownloadError("too_big", t("attachment_too_big"))
                 handle.write(chunk)
         return local_path
     except AttachmentDownloadError:
@@ -790,7 +754,7 @@ def message_inputs(message):
         mime = str(document.get("mime_type") or "").lower()
         name = str(document.get("file_name") or "document")
         if not document.get("file_id"):
-            raise UnsupportedAttachmentError("Файл не прочитан: Telegram не передал его идентификатор.")
+            raise UnsupportedAttachmentError(t("attachment_no_file_id"))
         # No format allowlist: the mime/suffix check below only decides HOW
         # a document is handed to the model (inlined as text vs. left as a
         # local path for Codex to read itself with its own tools), never
@@ -843,9 +807,7 @@ def message_inputs(message):
         try:
             import faster_whisper  # noqa: F401
         except ImportError as exc:
-            raise UnsupportedAttachmentError(
-                "Голосовые сообщения не поддерживаются на этой установке."
-            ) from exc
+            raise UnsupportedAttachmentError(t("attachment_voice_unsupported")) from exc
         try:
             path = download_telegram_file(
                 voice["file_id"], "voice.ogg", chat_id=chat_id, file_size=voice.get("file_size"),
@@ -856,7 +818,7 @@ def message_inputs(message):
         paths.append(path)
         transcript = transcribe_voice(path)
         if not transcript:
-            raise UnsupportedAttachmentError("Голосовое сообщение не удалось распознать и оно не прочитано.")
+            raise UnsupportedAttachmentError(t("attachment_voice_transcription_failed"))
         inputs.append({"type": "text", "text": f"[Расшифровка голосового сообщения]\n{transcript}"})
 
     if not inputs and attachment_note:
@@ -897,6 +859,7 @@ def chat_state(chat_id):
     with state_lock:
         entry = state_db["chats"].setdefault(str(chat_id), {})
         entry.setdefault("thread_id", None)
+        entry.setdefault("language", "ru")
         entry.setdefault("model", None)
         entry.setdefault("effort", None)
         entry.setdefault("sandbox", CODEX_SANDBOX)
@@ -1133,7 +1096,7 @@ def tool_result_text(value, limit=1600):
         return pretty_tool_value(error, limit)
     # Do not fall back to the full result object: it commonly contains
     # structuredContent duplicates, resources, opaque IDs and base64 data.
-    return "результат получен"
+    return t("process_result_generic")
 
 
 def truncate_mdv2(text, limit=MAX_MESSAGE_LEN):
@@ -1149,9 +1112,9 @@ def truncate_mdv2(text, limit=MAX_MESSAGE_LEN):
 def item_label_and_blocks(item):
     item_type = item.get("type", "unknown")
     if item_type == "agent_message":
-        return "💬 Ответ", protocol_text(item.get("text", "")), []
+        return t("process_agent_message_label"), protocol_text(item.get("text", "")), []
     if item_type == "reasoning":
-        return "🧠 Размышление", protocol_text(
+        return t("process_reasoning_label"), protocol_text(
             item.get("text", item.get("summary", ""))
         ), []
     if item_type == "command_execution":
@@ -1160,16 +1123,19 @@ def item_label_and_blocks(item):
         output = item.get("aggregated_output")
         results = []
         if output not in (None, ""):
-            results.append(("📤 Результат", compact(str(output), 1800)))
+            results.append((t("process_result_label"), compact(str(output), 1800)))
         if exit_code is not None:
             try:
                 succeeded = int(exit_code) == 0
             except (TypeError, ValueError):
                 succeeded = False
-            results.append(("✅ Код завершения" if succeeded else "❌ Код завершения", str(exit_code)))
+            results.append((
+                t("process_exit_code_ok") if succeeded else t("process_exit_code_fail"),
+                str(exit_code),
+            ))
         # Match Claude's live renderer: identify the concrete tool instead of
         # exposing a generic "Выполняю" status.
-        return "🔧 Bash", compact(command, 1400), results
+        return t("process_bash_label"), compact(command, 1400), results
     if item_type == "file_change":
         # App Server includes the complete patch in changes[*].kind.diff.  A
         # Progress is a user-facing summary, not a debug console: exposing that payload can
@@ -1185,40 +1151,42 @@ def item_label_and_blocks(item):
             kind = change.get("kind")
             if isinstance(kind, dict):
                 kind = kind.get("type")
-            labels = {"add": "создан", "delete": "удалён", "update": "изменён"}
+            labels = {"add": t("process_file_change_add"), "delete": t("process_file_change_delete"),
+                      "update": t("process_file_change_update")}
             if path:
-                summaries.append(f"{path} — {labels.get(kind, kind or 'изменён')}")
-        content = "\n".join(summaries) or str(item.get("path") or "файл изменён")
-        return "📝 Изменение файла", compact(content, 1200), []
+                summaries.append(f"{path} — {labels.get(kind, kind or t('process_file_change_update'))}")
+        content = "\n".join(summaries) or str(item.get("path") or t("process_file_change_fallback"))
+        return t("process_file_change_label"), compact(content, 1200), []
     if item_type == "web_search":
-        query = item.get("query") or "поиск"
+        query = item.get("query") or t("process_web_search_default_query")
         action = item.get("action") or {}
         action_type = action.get("type") if isinstance(action, dict) else None
-        labels = {"openPage": "открываю страницу", "findInPage": "ищу на странице",
-                  "search": "ищу в интернете"}
+        labels = {"openPage": t("process_web_search_open_page"),
+                  "findInPage": t("process_web_search_find_in_page"),
+                  "search": t("process_web_search_searching")}
         suffix = labels.get(action_type)
         content = f"{suffix}: {query}" if suffix else str(query)
-        return "🔎 Поиск", compact(content, 1000), []
+        return t("process_web_search_label"), compact(content, 1000), []
     if item_type == "mcp_tool_call":
         name = ".".join(filter(None, (item.get("server"), item.get("tool")))) or "MCP"
         arguments = pretty_tool_value(item.get("arguments"))
         results = []
         if item.get("error"):
-            results.append(("❌ Ошибка", pretty_tool_value(item["error"], 1200)))
+            results.append((t("process_error_label"), pretty_tool_value(item["error"], 1200)))
         elif item.get("result") is not None:
-            results.append(("📤 Результат", tool_result_text(item["result"])))
-        return f"🔧 {name}", arguments, results
+            results.append((t("process_result_label"), tool_result_text(item["result"])))
+        return t("process_tool_label", name=name), arguments, results
     if item_type == "dynamic_tool_call":
-        name = ".".join(filter(None, (item.get("namespace"), item.get("tool")))) or "инструмент"
+        name = ".".join(filter(None, (item.get("namespace"), item.get("tool")))) or t("process_dynamic_tool_default_name")
         arguments = pretty_tool_value(item.get("arguments"))
         results = []
         if item.get("contentItems") is not None:
-            results.append(("📤 Результат", tool_result_text(
+            results.append((t("process_result_label"), tool_result_text(
                 {"contentItems": item.get("contentItems")}
             )))
-        return f"🔧 {name}", arguments, results
+        return t("process_tool_label", name=name), arguments, results
     if item_type in ("collab_agent_tool_call", "sub_agent_activity"):
-        tool = item.get("tool") or item.get("kind") or "работа агента"
+        tool = item.get("tool") or item.get("kind") or t("process_agent_default_tool")
         prompt = item.get("prompt")
         states = item.get("agentsStates") or {}
         state_text = ", ".join(
@@ -1226,31 +1194,31 @@ def item_label_and_blocks(item):
             for value in states.values()
         )
         content = pretty_tool_value(prompt, 1000) or state_text or str(tool)
-        return f"🤖 Агент · {tool}", content, []
+        return t("process_agent_label", tool=tool), content, []
     if item_type == "image_view":
-        return "🖼 Просмотр изображения", compact(item.get("path") or "изображение", 1000), []
+        return t("process_image_view_label"), compact(item.get("path") or t("process_image_fallback"), 1000), []
     if item_type == "image_generation":
         failure = item.get("failure")
-        return "🎨 Генерация изображения", (
-            pretty_tool_value(failure, 1000) if failure else "изображение создаётся"
+        return t("process_image_generation_label"), (
+            pretty_tool_value(failure, 1000) if failure else t("process_image_generation_in_progress")
         ), []
     if item_type == "context_compaction":
-        return "🗜 Сжатие контекста", "контекст сессии сжат", []
+        return t("process_context_compaction_label"), t("process_context_compaction_done"), []
     if item_type == "plan":
-        return "📋 План", compact(item.get("text") or "план обновлён", 1400), []
+        return t("process_plan_label"), compact(item.get("text") or t("process_plan_fallback"), 1400), []
     if item_type == "sleep":
         seconds = (item.get("durationMs") or 0) / 1000
-        return "⏳ Ожидание", f"{seconds:g} с", []
+        return t("process_sleep_label"), t("process_sleep_seconds", seconds=f"{seconds:g}"), []
     if item_type in ("entered_review_mode", "exited_review_mode"):
-        text = "режим проверки включён" if item_type.startswith("entered") else "режим проверки завершён"
-        return "🔍 Проверка", text, []
+        text = t("process_review_entered") if item_type.startswith("entered") else t("process_review_exited")
+        return t("process_review_label"), text, []
     # Future App Server item types must degrade to a short label. Never put
     # the complete protocol object into Telegram: it may contain huge output,
     # patches, base64 media, internal IDs or other implementation details.
     # Unknown/future protocol items still get a useful, neutral label.  Do
     # not leak the product name or invent a fake "action"/"in progress"
     # payload when the protocol did not provide one.
-    return "🔧 Инструмент", str(item_type).replace("_", " "), []
+    return t("process_unknown_label"), str(item_type).replace("_", " "), []
 
 
 def normalize_app_item(item):
@@ -1289,16 +1257,13 @@ def user_facing_codex_error(error):
         text = str(error)
         info = None
     else:
-        text = str(error.get("message") or "Неизвестная ошибка Codex")
+        text = str(error.get("message") or t("codex_unknown_error"))
         info = error.get("codexErrorInfo")
     combined = f"{info or ''} {text}".lower()
     if "contextwindowexceeded" in combined or "context window" in combined:
-        return (
-            "Контекст текущей сессии исчерпан. Используй /compact, чтобы сжать "
-            "историю и продолжить, либо /new для новой сессии."
-        )
+        return t("context_window_exceeded")
     if "sessionbudgetexceeded" in combined:
-        return "Бюджет этой сессии исчерпан. Начни новую через /new."
+        return t("session_budget_exceeded")
     if "usagelimitexceeded" in combined:
         return usage_limit_exceeded_message()
     return compact(text, 1000)
@@ -1308,8 +1273,8 @@ def usage_limit_exceeded_message(runtime=None):
     with process_lock:
         limits = dict((runtime.last_rate_limits if runtime else None) or {})
     windows = [
-        ("5-часовой лимит", limits.get("primary")),
-        ("недельный лимит", limits.get("secondary")),
+        (t("usage_window_5h"), limits.get("primary")),
+        (t("usage_window_weekly"), limits.get("secondary")),
     ]
     reached = [(label, window) for label, window in windows
                if isinstance(window, dict) and int(window.get("usedPercent") or 0) >= 100]
@@ -1319,12 +1284,12 @@ def usage_limit_exceeded_message(runtime=None):
             available, key=lambda pair: int(pair[1].get("usedPercent") or 0), reverse=True
         )[:1]
     if not reached:
-        return "Лимит сессии Codex исчерпан. Попробуй позже; актуальное состояние — /usage."
+        return t("usage_limit_exceeded_generic")
     details = "; ".join(
-        f"{label}, сброс {format_reset_time(window.get('resetsAt'))}"
+        t("usage_window_reset", label=label, reset=format_reset_time(window.get('resetsAt')))
         for label, window in reached
     )
-    return f"⏳ Лимит сессии Codex исчерпан: {details}. После сброса можно продолжить этот же тред."
+    return t("usage_limit_exceeded_details", details=details)
 
 
 def render_process_item(item):
@@ -1341,16 +1306,16 @@ def format_usage(usage):
     if not isinstance(usage, dict):
         return compact(usage, 300)
     parts = []
-    for key, label in (("input_tokens", "in"), ("cached_input_tokens", "cached"),
-                       ("output_tokens", "out"),
-                       ("reasoning_output_tokens", "reasoning")):
+    for key, label_key in (("input_tokens", "usage_label_in"), ("cached_input_tokens", "usage_label_cached"),
+                       ("output_tokens", "usage_label_out"),
+                       ("reasoning_output_tokens", "usage_label_reasoning")):
         if key in usage:
-            parts.append(f"{label}: {usage[key]}")
+            parts.append(f"{t(label_key)}: {usage[key]}")
     return ", ".join(parts) if parts else compact(usage, 300)
 
 
 def send_plain(chat_id, text):
-    text = text or "(пусто)"
+    text = text or t("empty_placeholder")
     last = None
     while text:
         part, text = text[:MAX_MESSAGE_LEN], text[MAX_MESSAGE_LEN:]
@@ -1428,7 +1393,7 @@ def send_document(chat_id, path, caption=""):
     if size > FILE_SEND_MAX_BYTES:
         return {
             "ok": False,
-            "description": f"Файл больше лимита {FILE_SEND_MAX_BYTES} байт.",
+            "description": t("file_over_limit", limit=FILE_SEND_MAX_BYTES),
         }
     if LOCAL_BOT_API:
         local_result = tg_call("sendDocument", {
@@ -1447,14 +1412,11 @@ def send_document(chat_id, path, caption=""):
         if ("description" not in local_result and "error_code" not in local_result) or locally_suppressed:
             if locally_suppressed:
                 return local_result
-            detail = str(local_result.get("error") or "неизвестная ошибка связи")
+            detail = str(local_result.get("error") or t("unknown_connection_error"))
             return {
                 "ok": False,
                 "error": local_result.get("error"),
-                "description": (
-                    "Не удалось подтвердить отправку файла: ошибка связи или таймаут "
-                    f"({detail}). Файл не был отправлен повторно, чтобы избежать дубля."
-                ),
+                "description": t("file_send_unconfirmed", detail=detail),
             }
         # A local Bot API can reject file:// when the bot and server do not
         # share a mount. Its documented fallback is the normal upload.
@@ -1562,7 +1524,7 @@ def send_persona(chat_id):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(contents)
-            result = send_document(chat_id, temporary, caption="Текущая персона")
+            result = send_document(chat_id, temporary, caption=t('persona_current_caption'))
         finally:
             try:
                 os.unlink(temporary)
@@ -1590,21 +1552,21 @@ def handle_persona_reply(message):
             )
             contents = Path(local_path).read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            send_plain(chat_id, "Файл персоны должен быть текстовым UTF-8 Markdown-файлом.")
+            send_plain(chat_id, t('persona_file_type_error'))
             return True
         except Exception as exc:
-            send_plain(chat_id, f"Не удалось прочитать файл персоны: {compact(str(exc), 500)}")
+            send_plain(chat_id, t('persona_file_read_error', error=compact(str(exc), 500)))
             return True
     else:
         contents = message.get("text")
         if not isinstance(contents, str):
-            send_plain(chat_id, "Пришли текст персоны или UTF-8 Markdown-файл ответом на сообщение.")
+            send_plain(chat_id, t('persona_reply_prompt'))
             return True
     if not contents.strip():
-        send_plain(chat_id, "Пустая персона не сохранена.")
+        send_plain(chat_id, t('persona_empty'))
         return True
     _write_persona(_persona_path(chat_id), contents)
-    send_plain(chat_id, "✅ Персона обновлена.")
+    send_plain(chat_id, t('persona_updated'))
     return True
 
 
@@ -1617,7 +1579,7 @@ def send_photo(chat_id, path, caption=""):
     """
     source = Path(path)
     if not source.is_file():
-        return {"ok": False, "description": "Файл изображения не найден."}
+        return {"ok": False, "description": t("image_file_not_found")}
     if source.stat().st_size > PHOTO_SEND_MAX_BYTES:
         return send_document(chat_id, source, caption)
 
@@ -1704,34 +1666,34 @@ def process_file_send_queue():
 
         ok = False
         if not isinstance(request, dict):
-            message = "Отклонено: повреждённый запрос отправки файла."
+            message = t("file_send_malformed_request")
         else:
             chat_id = request.get("chat_id")
             path = request.get("path")
             caption = request.get("caption", "")
             if not isinstance(chat_id, int) or isinstance(chat_id, bool):
-                message = "Отклонено: некорректный Telegram chat_id."
+                message = t("file_send_bad_chat_id")
             elif str(chat_id) not in load_whitelist():
-                message = "Отклонено: Telegram ID отсутствует в whitelist."
+                message = t("file_send_not_whitelisted")
             elif not isinstance(path, str) or not isinstance(caption, str):
-                message = "Отклонено: некорректный путь или подпись."
+                message = t("file_send_bad_path_or_caption")
             elif len(caption) > FILE_SEND_MAX_CAPTION_CHARS:
-                message = "Отклонено: подпись длиннее лимита Telegram."
+                message = t("file_send_caption_too_long")
             else:
                 source = _file_in_tenant_outbox(chat_id, path)
                 if source is None:
-                    message = "Отклонено: файл должен быть обычным файлом из CODEX_TELEGRAM_OUTBOX."
+                    message = t("file_send_outside_outbox")
                 elif source.stat().st_size > FILE_SEND_MAX_BYTES:
-                    message = f"Отклонено: файл больше {FILE_SEND_MAX_BYTES} байт."
+                    message = t("file_send_too_big", limit=FILE_SEND_MAX_BYTES)
                 else:
                     result = send_document(chat_id, source, caption)
                     ok = bool(result.get("ok"))
                     if ok:
-                        message = f"Файл «{source.name}» отправлен в Telegram."
+                        message = t("file_send_delivered", name=source.name)
                     else:
-                        message = "Telegram не принял файл: " + compact(
+                        message = t("file_send_rejected", detail=compact(
                             str(result.get("description") or result.get("error") or result), 500,
-                        )
+                        ))
         try:
             _write_file_send_result(request_id, ok, message)
         except Exception as exc:
@@ -1883,7 +1845,7 @@ class TurnView:
             for result_label, result_content in results:
                 lines.extend((escape_mdv2(f"{result_label}:"),
                               mdv2_code_block(result_content)))
-        body = "\n".join(lines) if lines else "Думаю"
+        body = "\n".join(lines) if lines else t("thinking_placeholder")
         return f"🤔 {body}"
 
     def _send_or_edit_live(self, text, force=False):
@@ -1969,13 +1931,13 @@ class TurnView:
                     break
 
         if stopped:
-            answer = "⏹ Выполнение остановлено."
+            answer = t("turn_stopped")
         elif error:
-            answer = f"⚠️ Ошибка Codex: {error}"
+            answer = t("turn_codex_error", error=error)
         else:
-            answer = final_text or "(нет ответа — смотри процесс выше)"
+            answer = final_text or t("turn_no_answer")
         if self.usage is not None:
-            answer += f"\n\nТокены: {format_usage(self.usage)}"
+            answer += t("turn_tokens_line", usage=format_usage(self.usage))
         if self.context_notice:
             answer += f"\n\n{self.context_notice}"
         with state_lock:
@@ -1992,12 +1954,12 @@ class TurnView:
         # itself ended up using.
         if prior_thread_id is not None and thread_id:
             if prior_thread_id:
-                answer += (
-                    f"\n\nТвой session id (до делегации): `{prior_thread_id[:8]}`. "
-                    f"Продолжить делегированную: `/resume {thread_id[:8]}`"
+                answer += t(
+                    "turn_delegation_footer_with_prior",
+                    prior_thread_id=prior_thread_id[:8], thread_id=thread_id[:8],
                 )
             else:
-                answer += f"\n\nПродолжить делегированную сессию: `/resume {thread_id[:8]}`"
+                answer += t("turn_delegation_footer", thread_id=thread_id[:8])
             # The old owner-key delegation path is live only for this one
             # turn -- preserve c130528's rollback so the next ordinary
             # Telegram message continues the owner's own conversation.
@@ -2037,9 +1999,9 @@ class TurnView:
             visible.reverse()
             hidden = len(process_steps) - len(visible)
             if hidden:
-                visible.insert(0, f"…и ещё {hidden} шагов выше…")
+                visible.insert(0, t("process_hidden_steps", hidden=hidden))
             body = "\n".join(visible)
-            rich = f"<details><summary>🔧 Процесс ({len(process_steps)})</summary>\n{body}\n</details>"
+            rich = t("process_details_block", count=len(process_steps), body=body)
             if not self.replace_progress(rich):
                 send_rich(self.chat_id, rich)
             # A genuinely NEW message here is deliberate: an edit doesn't
@@ -2126,14 +2088,14 @@ def handle_app_notification(runtime, method, params):
             update_state(runtime.state_key, account_status="awaiting_display_name")
             send_plain(
                 runtime.chat_id,
-                "✅ Вход в аккаунт Codex завершён.\n\nКак к тебе обращаться?",
+                t('login_complete_ask_name'),
             )
         elif success:
             update_state(runtime.state_key, account_status="ready")
-            send_plain(runtime.chat_id, "✅ Вход в аккаунт Codex завершён.")
+            send_plain(runtime.chat_id, t('login_complete'))
         else:
             update_state(runtime.state_key, account_status="login_failed")
-            send_plain(runtime.chat_id, f"❌ Вход не завершён: {params.get('error') or 'неизвестная ошибка'}")
+            send_plain(runtime.chat_id, t('login_failed', error=params.get('error') or t('login_unknown_error')))
         return
     with process_lock:
         view = runtime.active_view
@@ -2163,7 +2125,7 @@ def handle_app_notification(runtime, method, params):
             }[method]
             view.add_event({"type": event_type, "item": item})
             if item.get("type") == "context_compaction" and method.endswith("completed"):
-                view.context_notice = "🗜 Контекст сессии автоматически сжат."
+                view.context_notice = t("context_auto_compacted")
     elif method == "item/agentMessage/delta":
         view.add_thought_delta(
             params.get("delta", ""),
@@ -2177,13 +2139,9 @@ def handle_app_notification(runtime, method, params):
         if context_window and context_tokens:
             ratio = context_tokens / context_window
             if ratio >= 0.9:
-                view.context_notice = (
-                    f"⚠️ Контекст заполнен на {ratio:.0%}. Рекомендуется /compact или /new."
-                )
+                view.context_notice = t("context_fill_critical", percent=f"{ratio:.0%}")
             elif ratio >= 0.8:
-                view.context_notice = (
-                    f"⚠️ Контекст заполнен на {ratio:.0%}; скоро понадобится /compact."
-                )
+                view.context_notice = t("context_fill_warning", percent=f"{ratio:.0%}")
         update_state(
             runtime.state_key,
             last_usage=view.usage,
@@ -2192,13 +2150,13 @@ def handle_app_notification(runtime, method, params):
         )
     elif method == "error" and not params.get("willRetry"):
         with process_lock:
-            error = params.get("error", "неизвестная ошибка")
+            error = params.get("error", t("unknown_error_lowercase"))
             if isinstance(error, dict) and error.get("codexErrorInfo") == "usageLimitExceeded":
                 runtime.active_error = usage_limit_exceeded_message(runtime)
             else:
                 runtime.active_error = user_facing_codex_error(error)
     elif method == "thread/compacted":
-        view.context_notice = "🗜 Контекст сессии сжат."
+        view.context_notice = t("compact_done_short")
         force = True
         if done is not None:
             done.set()
@@ -2311,18 +2269,18 @@ def resolve_delegate_settings(runtime, current_model=None, current_effort=None,
     if requested_model is not None:
         chosen = resolve_model_choice(models, requested_model)
         if chosen is None:
-            raise ValueError(f"Модель «{requested_model}» недоступна.")
+            raise ValueError(t("delegate_model_unavailable", model=requested_model))
     else:
         chosen = select_model_from_catalog(models, current_model)
     if not chosen:
-        raise ValueError("Codex не вернул доступных моделей.")
+        raise ValueError(t("model_empty"))
 
     supported = supported_reasoning_efforts(chosen)
     if requested_effort is not None:
         effort = resolve_effort_choice(chosen, requested_effort)
         if effort is None:
             raise ValueError(
-                f"Мощность «{requested_effort}» недоступна для {model_key(chosen)}."
+                t("delegate_effort_unavailable", effort=requested_effort, model=model_key(chosen))
             )
     else:
         effort = (current_effort if current_effort in supported else
@@ -2335,13 +2293,13 @@ def render_model_picker(runtime):
     models = available_models(runtime)
     chosen = selected_model(runtime, models)
     current = model_key(chosen) if chosen else None
-    lines = ["🧠 Доступные модели:"]
+    lines = [t("model_picker_header")]
     for model in models:
         key = model_key(model)
         name = model.get("displayName") or key
         lines.append(f"{'●' if key == current else '○'} {name} — `/model {key}`")
     if not models:
-        lines.append("Список моделей пуст.")
+        lines.append(t("model_picker_empty"))
     return "  \n".join(lines)
 
 
@@ -2349,9 +2307,9 @@ def render_effort_picker(runtime):
     models = available_models(runtime)
     chosen = selected_model(runtime, models)
     if not chosen:
-        return "Codex не вернул доступных моделей."
+        return t("model_empty")
     current = chat_state(runtime.state_key).get("effort")
-    lines = [f"⚡ Мощность модели {chosen.get('displayName') or model_key(chosen)}:"]
+    lines = [t("effort_picker_header", model=chosen.get('displayName') or model_key(chosen))]
     for option in effort_options(chosen):
         effort = option["reasoningEffort"]
         description = option.get("description")
@@ -2384,7 +2342,7 @@ def ensure_thread(runtime, client, requested_thread_id):
             raise
         log(f"Thread {requested_thread_id} no longer exists; starting a new thread")
         result = client.request("thread/start", _thread_params(runtime), timeout=60)
-        send_plain(runtime.chat_id, "Прежняя сессия не найдена; начата новая сессия Codex.")
+        send_plain(runtime.chat_id, t('session_missing_new_started'))
     thread_id = ((result or {}).get("thread") or {}).get("id")
     if not thread_id:
         raise AppServerError(f"{method} returned no thread id")
@@ -2481,10 +2439,10 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
                 process = client.process
             now = time.monotonic()
             if process is None or process.poll() is not None:
-                error = "постоянный процесс Codex неожиданно завершился"
+                error = t("codex_process_died")
                 break
             if now - last_event > IDLE_TIMEOUT_S or now - started_at > TOTAL_TIMEOUT_S:
-                error = "Codex остановлен по таймауту"
+                error = t("codex_timed_out")
                 stop_current_process(runtime)
                 break
         with process_lock:
@@ -2543,11 +2501,11 @@ def run_compaction(runtime, thread_id):
             runtime.active_last_event_at = time.monotonic()
         client.request("thread/compact/start", {"threadId": server_thread_id}, timeout=60)
         if not done.wait(TOTAL_TIMEOUT_S):
-            error = "Сжатие контекста не завершилось за отведённое время."
+            error = t("compact_timeout")
         with process_lock:
             error = error or runtime.active_error
         if error:
-            message = f"🗜 Не удалось сжать контекст: {error}"
+            message = t("compact_failed", error=error)
             send_plain(chat_id, message)
         else:
             update_state(
@@ -2556,10 +2514,10 @@ def run_compaction(runtime, thread_id):
                 session_usage=None,
                 context_window=None,
             )
-            message = "🗜 Контекст сессии сжат. Можно продолжать."
+            message = t("compact_done")
             send_plain(chat_id, message)
     except Exception as exc:
-        message = f"🗜 Не удалось сжать контекст: {user_facing_codex_error(exc)}"
+        message = t("compact_failed", error=user_facing_codex_error(exc))
         send_plain(chat_id, message)
     finally:
         with process_lock:
@@ -2647,11 +2605,11 @@ def format_reset_time(timestamp):
         reset = datetime.fromtimestamp(int(timestamp)).astimezone()
         remaining = max(0, int(timestamp) - int(time.time()))
         if remaining < 3600:
-            relative = f"через {max(1, remaining // 60)} мин"
+            relative = t("relative_time_minutes", value=max(1, remaining // 60))
         elif remaining < 86400:
-            relative = f"через {remaining // 3600} ч {remaining % 3600 // 60} мин"
+            relative = t("relative_time_hours_minutes", hours=remaining // 3600, minutes=remaining % 3600 // 60)
         else:
-            relative = f"через {remaining // 86400} д {remaining % 86400 // 3600} ч"
+            relative = t("relative_time_days_hours", days=remaining // 86400, hours=remaining % 86400 // 3600)
         return f"{reset:%d.%m %H:%M} ({relative})"
     except (TypeError, ValueError, OSError):
         return "—"
@@ -2659,11 +2617,11 @@ def format_reset_time(timestamp):
 
 def rate_limit_line(label, window):
     if not isinstance(window, dict):
-        return f"{label}: нет данных"
+        return t("rate_limit_no_data", label=label)
     used = int(window.get("usedPercent") or 0)
-    return (
-        f"{label}: использовано {used}% · осталось {max(0, 100 - used)}% · "
-        f"сброс {format_reset_time(window.get('resetsAt'))}"
+    return t(
+        "rate_limit_line", label=label, used=used, remaining=max(0, 100 - used),
+        reset=format_reset_time(window.get('resetsAt')),
     )
 
 
@@ -2698,44 +2656,52 @@ def build_usage_report(runtime):
     messages = session_message_count(runtime, thread_id)
     context_tokens = last.get("input_tokens")
     context_window = snapshot.get("context_window")
-    context = f"~{fmt_number(context_tokens)} tokens" if context_tokens else "нет данных"
+    context = t("usage_context_tokens", tokens=fmt_number(context_tokens)) if context_tokens else t("usage_no_data")
     if context_tokens and context_window:
         context += f" / {fmt_number(context_window)} ({context_tokens / context_window:.1%})"
     lines = [
-        "📊 Session",
-        f"{(thread_id or 'нет активной')[:8]}  •  Model: {snapshot.get('model') or 'не определена'}"
-        f"  •  Effort: {snapshot.get('effort') or 'не определён'}",
-        f"Messages: {messages if messages is not None else '—'}",
-        f"Context: {context}",
+        t("usage_session_header"),
+        t(
+            "usage_session_line",
+            thread_id=(thread_id or t("usage_no_active_session"))[:8],
+            model=snapshot.get('model') or t('status_unknown'),
+            effort=snapshot.get('effort') or t('usage_effort_unknown'),
+        ),
+        t("usage_messages_line", messages=messages if messages is not None else "—"),
+        t("usage_context_line", context=context),
         "",
-        "🔢 Tokens (this session)",
-        f"in {fmt_number(total.get('input_tokens'))}  ·  out {fmt_number(total.get('output_tokens'))}  ·  "
-        f"cache-r {fmt_number(total.get('cached_input_tokens'))}  ·  "
-        f"cache-w {fmt_number(total.get('cache_write_input_tokens'))}",
+        t("usage_tokens_header"),
+        t(
+            "usage_tokens_line",
+            input_tokens=fmt_number(total.get('input_tokens')),
+            output_tokens=fmt_number(total.get('output_tokens')),
+            cache_read=fmt_number(total.get('cached_input_tokens')),
+            cache_write=fmt_number(total.get('cache_write_input_tokens')),
+        ),
     ]
     thread_usage = (usage_result or {}).get("threadUsage") or {}
     usd_micros = thread_usage.get("estimatedUsageUsdMicros")
     if usd_micros is not None:
-        lines.append(f"(~${usd_micros / 1_000_000:.4f} эквивалент по API-тарифу)")
+        lines.append(t("usage_cost_api_equivalent", usd=f"{usd_micros / 1_000_000:.4f}"))
     elif usage_error:
-        lines.append(f"Стоимость: не удалось получить ({usage_error})")
+        lines.append(t("usage_cost_error", error=usage_error))
     else:
-        lines.append("Стоимость: недоступна для текущего subscription-маршрута")
+        lines.append(t("usage_cost_unavailable"))
 
-    lines.extend(("", "📈 Account limits (subscription, not credits)"))
+    lines.extend(("", t("usage_limits_header")))
     limits = (limits_result or {}).get("rateLimits") or {}
     if limits:
         plan = limits.get("planType")
         if plan:
-            lines.append(f"Plan: {str(plan).replace('_', ' ').title()}")
+            lines.append(t("usage_plan_line", plan=str(plan).replace('_', ' ').title()))
         lines.append(rate_limit_line("5-hour", limits.get("primary")))
         lines.append(rate_limit_line("Weekly", limits.get("secondary")))
         credits = limits.get("credits") or {}
         if credits.get("hasCredits") or credits.get("unlimited"):
             balance = "unlimited" if credits.get("unlimited") else credits.get("balance")
-            lines.append(f"Credits: {balance}")
+            lines.append(t("usage_credits_line", balance=balance))
     else:
-        lines.append(f"Не удалось получить: {limits_error or 'нет данных'}")
+        lines.append(t("usage_limits_failed", error=limits_error or t("usage_no_data")))
     return "\n".join(lines)
 
 
@@ -2789,7 +2755,7 @@ def restart_watcher():
             RESTART_SIGNAL_FILE.unlink()
         except FileNotFoundError:
             pass
-        result = send_plain(chat_id, "🔄 Текущий ход завершён. Перезапускаю Codex-бота…")
+        result = send_plain(chat_id, t('restart_after_turn'))
         message_id = (result.get("result") or {}).get("message_id") if result else None
         update_runtime_state(
             restart_completed_chat_id=chat_id,
@@ -2892,18 +2858,16 @@ def cross_delegate_watcher():
 
             ok = False
             if not isinstance(request, dict):
-                result_text = "Отклонено: повреждённый формат запроса делегации."
+                result_text = t("cross_delegate_malformed_request")
             else:
                 chat_id = request.get("chat_id")
                 text = request.get("text")
                 if not isinstance(chat_id, int) or isinstance(chat_id, bool):
-                    result_text = "Отклонено: некорректный Telegram chat_id."
+                    result_text = t("cross_delegate_bad_chat_id")
                 elif not isinstance(text, str) or not text.strip():
-                    result_text = "Отклонено: пустой текст задачи."
+                    result_text = t("cross_delegate_empty_text")
                 elif str(chat_id) not in load_whitelist():
-                    result_text = (
-                        "Отклонено: этот Telegram ID отсутствует в whitelist Codex-бота."
-                    )
+                    result_text = t("cross_delegate_not_whitelisted")
                 else:
                     with state_lock:
                         account = state_db.get("chats", {}).get(str(chat_id), {})
@@ -2911,25 +2875,19 @@ def cross_delegate_watcher():
                             account.get("account_status") if isinstance(account, dict) else None
                         )
                     if account_status != "ready":
-                        result_text = (
-                            "Отклонено: Codex-аккаунт для этого Telegram ID не готов. "
-                            "Сначала заверши /login в Codex-боте."
-                        )
+                        result_text = t("cross_delegate_account_not_ready")
                     else:
                         ok = start_delegate_turn(chat_id, text)
                         if ok:
-                            result_text = (
-                                "Принято: Codex-бот запустил задачу. Результат придёт "
-                                "в этот же Telegram-чат от Codex-бота."
-                            )
+                            result_text = t("cross_delegate_accepted")
                         else:
                             runtime = get_delegate_tenant(chat_id)
                             with process_lock:
                                 busy = runtime.busy or bool(runtime.pending_batch)
                             result_text = (
-                                "Отклонено: уже выполняется предыдущая делегированная задача."
+                                t("cross_delegate_already_running")
                                 if busy else
-                                "Отклонено: Codex-бот не смог запустить делегированную задачу."
+                                t("cross_delegate_start_failed")
                             )
             try:
                 _write_cross_delegate_result(request_id, ok, result_text)
@@ -3159,7 +3117,7 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
     delegate_thread_id = delegate_state.get("thread_id")
 
     if requested_thread_id and requested_env:
-        _delegate_error(chat_id, "Нельзя использовать --env вместе с --resume.")
+        _delegate_error(chat_id, t('delegate_env_resume_conflict'))
         return False
 
     if requested_thread_id:
@@ -3180,8 +3138,7 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
         if not valid_delegate_thread or owner_thread_conflict:
             _delegate_error(
                 chat_id,
-                "Нельзя продолжить эту делегацию: resume_thread_id не совпадает "
-                "с последним делегированным тредом.",
+                t('delegate_resume_thread_mismatch'),
             )
             return False
 
@@ -3203,7 +3160,7 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
                 runtime.loaded_thread_id = None
                 runtime.loaded_server_pid = None
     if delegate_busy:
-        _delegate_error(chat_id, "Уже выполняю предыдущую делегированную задачу.")
+        _delegate_error(chat_id, t('delegate_already_running'))
         return False
 
     requested_settings = None
@@ -3227,7 +3184,7 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
                 runtime.busy = False
             _delegate_error(
                 chat_id,
-                f"Не удалось проверить настройки делегации: {compact(str(exc), 500)}",
+                t('delegate_settings_error', error=compact(str(exc), 500)),
             )
             return False
 
@@ -3277,14 +3234,14 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
             runtime.busy = False
             runtime.pending_env = None
             runtime.close_app_server_after_turn = False
-        _delegate_error(chat_id, f"Не удалось запустить делегированную задачу: {compact(str(exc), 500)}")
+        _delegate_error(chat_id, t('delegate_start_error', error=compact(str(exc), 500)))
         return False
     return True
 
 
 def start_account_login(runtime):
     if runtime.chat_id == OWNER_ID:
-        send_plain(runtime.chat_id, "Владелец использует основной аккаунт ~/.codex; отдельный вход не требуется.")
+        send_plain(runtime.chat_id, t('login_owner_not_needed'))
         return
     try:
         client = get_app_server(runtime)
@@ -3296,15 +3253,11 @@ def start_account_login(runtime):
         update_state(runtime.state_key, account_status="awaiting_login")
         send_plain(
             runtime.chat_id,
-            "🔐 Подключение отдельного аккаунта Codex\n\n"
-            f"1. Открой: {result.get('verificationUrl')}\n"
-            f"2. Введи код: {result.get('userCode')}\n\n"
-            "Токены сохранятся только в твоём изолированном CODEX_HOME. "
-            "Бот сообщит, когда вход завершится.",
+            t('login_device_instructions', verification_url=result.get('verificationUrl'), user_code=result.get('userCode')),
         )
     except Exception as exc:
         update_state(runtime.state_key, account_status="login_failed")
-        send_plain(runtime.chat_id, f"Не удалось начать вход в Codex: {compact(str(exc), 500)}")
+        send_plain(runtime.chat_id, t('login_start_error', error=compact(str(exc), 500)))
 
 
 def account_status_report(runtime):
@@ -3313,13 +3266,13 @@ def account_status_report(runtime):
         account = result.get("account") or {}
         if not account:
             update_state(runtime.state_key, account_status=None)
-            return "Аккаунт Codex не подключён. Используй /login."
+            return t("account_not_connected")
         update_state(runtime.state_key, account_status="ready")
-        label = account.get("email") or account.get("type") or "подключён"
+        label = account.get("email") or account.get("type") or t("account_connected")
         plan = account.get("planType") or account.get("plan_type")
-        return f"Аккаунт: {label}" + (f"\nПлан: {plan}" if plan else "")
+        return t("account_summary", label=label) + (t("account_plan_line", plan=plan) if plan else "")
     except Exception as exc:
-        return f"Не удалось прочитать аккаунт: {compact(str(exc), 500)}"
+        return t("account_read_error", error=compact(str(exc), 500))
 
 
 def account_is_ready(runtime):
@@ -3385,7 +3338,7 @@ def _update_local_bot_api_status(status, text, force=False):
 
 
 def _finish_local_bot_api_failure(runtime, status, details):
-    text = f"⚠️ Не удалось включить локальный сервер: {compact(details, 500)}"
+    text = t("local_api_failure", details=compact(details, 500))
     try:
         _update_local_bot_api_status(status, text, force=True)
     except Exception as exc:
@@ -3397,16 +3350,16 @@ def _finish_local_bot_api_failure(runtime, status, details):
     # already pulled new code -- a failed local-server switch must not also
     # leave that update unapplied. .env is untouched on this path (still
     # cloud mode, exactly as before), so restarting is safe either way.
-    send_plain(runtime.chat_id, "🔁 Перезапускаю бота, чтобы обновление вступило в силу…")
+    send_plain(runtime.chat_id, t('local_api_restart_now'))
     request_restart(OWNER_ID)
 
 
 def _write_telegram_api_url(url):
     """Replace TELEGRAM_API_URL in the protected deployment .env file."""
     if not BOT_ENV_FILE.exists():
-        raise RuntimeError(f"Не найден {BOT_ENV_FILE}")
+        raise RuntimeError(t("local_api_env_file_missing", path=BOT_ENV_FILE))
     if "\n" in url or "\r" in url:
-        raise RuntimeError("Установщик вернул недопустимый адрес локального сервера")
+        raise RuntimeError(t("local_api_bad_url"))
     lines = BOT_ENV_FILE.read_text(encoding="utf-8").splitlines()
     prefix = "TELEGRAM_API_URL="
     lines = [line for line in lines if not line.startswith(prefix)]
@@ -3429,13 +3382,13 @@ def _run_local_bot_api_install(runtime, api_id=None, api_hash=None):
     }
     output_tail = deque(maxlen=20)
     stage_text = {
-        "dependencies": "⏳ Проверяю зависимости сборки…",
-        "build": "⏳ Собираю локальный Bot API сервер (может занять ~15 минут)…",
-        "install": "⏳ Устанавливаю сервис…",
-        "done": "✅ Локальный сервер собран.",
+        "dependencies": t("local_api_stage_dependencies"),
+        "build": t("local_api_stage_build"),
+        "install": t("local_api_stage_install"),
+        "done": t("local_api_stage_done"),
     }
     try:
-        _update_local_bot_api_status(status, "⏳ Готовлю локальный Bot API сервер…", force=True)
+        _update_local_bot_api_status(status, t("local_api_preparing"), force=True)
         env = dict(os.environ)
         if api_id is not None:
             env["TELEGRAM_API_ID"] = api_id
@@ -3459,18 +3412,16 @@ def _run_local_bot_api_install(runtime, api_id=None, api_hash=None):
                     _update_local_bot_api_status(status, stage_text[stage], force=True)
             elif line.startswith("REUSE:existing"):
                 _update_local_bot_api_status(
-                    status,
-                    "✅ Найден уже настроенный локальный сервер, пересобирать не нужно.",
-                    force=True,
+                    status, t("local_api_reuse_existing"), force=True,
                 )
             elif line.startswith("LOCAL_BOT_API_URL="):
                 local_url = line[len("LOCAL_BOT_API_URL="):].strip()
         exit_code = process.wait()
         if exit_code != 0:
             tail = "\n".join(output_tail)[-500:]
-            raise RuntimeError(tail or f"Установщик завершился с кодом {exit_code}")
+            raise RuntimeError(tail or t("local_api_installer_failed", code=exit_code))
         if not local_url:
-            raise RuntimeError("Установщик не сообщил адрес локального сервера")
+            raise RuntimeError(t("local_api_installer_no_url"))
         switch = subprocess.run(
             [str(LOCAL_BOT_API_SWITCH_SCRIPT), local_url],
             cwd=str(Path(__file__).parent),
@@ -3479,9 +3430,9 @@ def _run_local_bot_api_install(runtime, api_id=None, api_hash=None):
         )
         if switch.returncode != 0:
             raise RuntimeError((switch.stderr or switch.stdout or
-                                f"Переключатель завершился с кодом {switch.returncode}")[-500:])
+                                t("local_api_switch_failed", code=switch.returncode))[-500:])
         _write_telegram_api_url(local_url)
-        _update_local_bot_api_status(status, "✅ Готово. Перезапускаю бота…", force=True)
+        _update_local_bot_api_status(status, t("local_api_ready_restarting"), force=True)
         request_restart(OWNER_ID)
     except Exception as exc:
         _finish_local_bot_api_failure(runtime, status, str(exc))
@@ -3498,8 +3449,7 @@ def start_local_bot_api_install(runtime, api_id=None, api_hash=None):
     if not _systemctl_unit_exists(TELEGRAM_BOT_API_UNIT) and not _local_bot_api_dependencies_available():
         status = {"chat_id": runtime.chat_id, "message_id": None, "last_edit_at": 0.0}
         _finish_local_bot_api_failure(
-            runtime, status,
-            "Не хватает зависимостей сборки. Прогони scripts/install-local-bot-api.sh из терминала вручную.",
+            runtime, status, t("local_api_missing_dependencies"),
         )
         return False
     with process_lock:
@@ -3550,15 +3500,14 @@ def repair_local_bot_api_service():
     if _systemctl_is_active(unit):
         return None
     if not _systemctl_unit_exists(unit):
-        return ("⚠️ Локальный сервер сконфигурирован, но не установлен на этом хосте — "
-                "прогони scripts/install-local-bot-api.sh из терминала вручную.")
+        return t("local_api_configured_not_installed")
     try:
         result = subprocess.run(
             ["sudo", "-n", "systemctl", "restart", f"{unit}.service"],
             capture_output=True, text=True, timeout=30, check=False,
         )
     except OSError as exc:
-        return f"⚠️ Не смог перезапустить локальный сервер: {compact(str(exc), 300)}"
+        return t("local_api_restart_failed", error=compact(str(exc), 300))
     if result.returncode != 0:
         details = (result.stderr or result.stdout or "").strip()
         permission_markers = (
@@ -3566,12 +3515,12 @@ def repair_local_bot_api_service():
             "no tty present", "permission denied",
         )
         if any(marker in details.lower() for marker in permission_markers):
-            return "⚠️ Нет прав перезапустить сервер, нужен sudoers-грант."
-        return f"⚠️ Не смог перезапустить локальный сервер: {compact(details, 300)}"
+            return t("local_api_no_sudo_permission")
+        return t("local_api_restart_failed", error=compact(details, 300))
     time.sleep(2)
     if _systemctl_is_active(unit) and _local_bot_api_port_ready():
-        return "🔧 Локальный сервер был неактивен, перезапустил."
-    return "⚠️ Не смог перезапустить локальный сервер: сервис или его порт не стал активен."
+        return t("local_api_was_inactive_restarted")
+    return t("local_api_restart_ineffective")
 
 
 def handle_update_flow_message(chat_id, text, runtime):
@@ -3585,7 +3534,7 @@ def handle_update_flow_message(chat_id, text, runtime):
     if stage == "installing":
         command = text.split(None, 1)[0].split("@", 1)[0].lower() if text else ""
         if command == "/update":
-            send_plain(chat_id, "Установка уже идёт, дождись.")
+            send_plain(chat_id, t('local_api_install_running'))
         return True
     if stage == "awaiting_yes_no":
         answer = text.strip().lower()
@@ -3595,7 +3544,7 @@ def handle_update_flow_message(chat_id, text, runtime):
             else:
                 with process_lock:
                     runtime.update_flow_stage = "awaiting_api_id"
-                send_plain(chat_id, "Пришли api_id")
+                send_plain(chat_id, t('local_api_ask_id'))
             return True
         with process_lock:
             runtime.update_flow_stage = None
@@ -3604,22 +3553,22 @@ def handle_update_flow_message(chat_id, text, runtime):
         # declining the local-server offer must not silently swallow that,
         # the same restart /update always does when nothing local-bot-api-
         # related comes up at all.
-        send_plain(chat_id, "Ладно. 🔁 Перезапускаю бота, чтобы обновление вступило в силу…")
+        send_plain(chat_id, t('local_api_declined_restart'))
         request_restart(chat_id)
         return True
     if stage == "awaiting_api_id":
         if not re.fullmatch(r"[0-9]+", text.strip()):
-            send_plain(chat_id, "Пришли api_id")
+            send_plain(chat_id, t('local_api_ask_id'))
             return True
         with process_lock:
             runtime.update_flow_api_id = text.strip()
             runtime.update_flow_stage = "awaiting_api_hash"
-        send_plain(chat_id, "Пришли api_hash")
+        send_plain(chat_id, t('local_api_ask_hash'))
         return True
     if stage == "awaiting_api_hash":
         api_hash = text.strip()
         if not api_hash:
-            send_plain(chat_id, "Пришли api_hash")
+            send_plain(chat_id, t('local_api_ask_hash'))
             return True
         with process_lock:
             api_id = runtime.update_flow_api_id
@@ -3636,20 +3585,20 @@ def handle_command(chat_id, command, runtime=None):
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
     if cmd in ("start", "help"):
-        send_plain(chat_id, "Codex Telegram bridge. Команды доступны в меню бота.")
+        send_plain(chat_id, t('help_intro'))
         return True
     if cmd == "persona":
         if chat_id != OWNER_ID:
-            send_plain(chat_id, "Персона доступна только владельцу в личном чате.")
+            send_plain(chat_id, t('persona_owner_only'))
             return True
         if arg.lower() == "reset":
             _write_persona(
                 _persona_path(chat_id),
                 Path(__file__).with_name("personality.example.md").read_text(encoding="utf-8"),
             )
-            send_plain(chat_id, "✅ Персона сброшена к шаблону по умолчанию.")
+            send_plain(chat_id, t('persona_reset_done'))
         elif arg:
-            send_plain(chat_id, "Использование: /persona или /persona reset")
+            send_plain(chat_id, t('persona_usage'))
         else:
             send_persona(chat_id)
         return True
@@ -3661,19 +3610,19 @@ def handle_command(chat_id, command, runtime=None):
         return True
     if cmd == "new":
         if not stop_and_wait_for_worker(runtime):
-            send_plain(chat_id, "Предыдущий ход ещё завершается; /new пока не выполнен.")
+            send_plain(chat_id, t('new_previous_turn_finishing'))
             return True
         cancel_pending_batch(runtime)
         update_state(state_key, thread_id=None, last_usage=None, session_usage=None, context_window=None)
-        send_plain(chat_id, "🆕 Текущий Codex-тред сброшен. Следующее сообщение начнёт новый.")
+        send_plain(chat_id, t('new_thread_reset'))
         return True
     if cmd == "sessions":
         current = chat_state(state_key).get("thread_id")
         rows = []
         for path in session_files(runtime)[:10]:
             sid, preview = session_info(path)
-            rows.append(f"{sid[:8]}{' ← текущая' if sid == current else ''}  {preview}")
-        send_plain(chat_id, "Последние сессии:\n" + ("\n".join(rows) or "не найдены"))
+            rows.append(f"{sid[:8]}{t('sessions_current_marker') if sid == current else ''}  {preview}")
+        send_plain(chat_id, t("sessions_list", rows="\n".join(rows) or t("sessions_none")))
         return True
     if cmd == "resume":
         # Delegated turns deliberately use a separate CODEX_HOME so their
@@ -3691,11 +3640,11 @@ def handle_command(chat_id, command, runtime=None):
                 if arg and sid.startswith(arg)
             )
         if len(matches) != 1:
-            send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")
+            send_plain(chat_id, t("resume_ambiguous") if matches else t("resume_not_found"))
         else:
             target_runtime, thread_id = matches[0]
             if not stop_and_wait_for_worker(target_runtime):
-                send_plain(chat_id, "Предыдущий ход ещё завершается; /resume пока не выполнен.")
+                send_plain(chat_id, t('resume_previous_turn_finishing'))
                 return True
             cancel_pending_batch(target_runtime)
             update_state(
@@ -3706,8 +3655,8 @@ def handle_command(chat_id, command, runtime=None):
                 delegate_runtime.state_key,
                 resume_selected=(target_runtime is delegate_runtime),
             )
-            kind = "делегированную " if target_runtime is delegate_runtime else ""
-            send_plain(chat_id, f"Продолжаю {kind}сессию {thread_id[:8]}.")
+            kind = t("resume_delegated_kind") if target_runtime is delegate_runtime else ""
+            send_plain(chat_id, t('resume_success', kind=kind, thread_id=thread_id[:8]))
         return True
     if cmd == "status":
         try:
@@ -3716,14 +3665,16 @@ def handle_command(chat_id, command, runtime=None):
             log(f"Could not resolve model for status: {exc}")
         with state_lock:
             snapshot = dict(chat_state(state_key))
-        send_plain(chat_id, "ℹ️ Статус\n"
-                   f"Сессия: {(snapshot.get('thread_id') or 'нет')[:8]}\n"
-                   f"Модель: {snapshot.get('model') or 'не определена'}\n"
-                   f"Мощность: {snapshot.get('effort') or 'не определена'}\n"
-                   f"Sandbox: {snapshot.get('sandbox')}\n"
-                   f"Workspace: {snapshot.get('workspace')}\n"
-                   f"Занят: {'да' if (runtime.busy or runtime.pending_batch) else 'нет'}\n"
-                   f"Аккаунт: {snapshot.get('account_status') or 'не подключён'}")
+        send_plain(chat_id, t(
+            'status_report',
+            thread_id=(snapshot.get('thread_id') or t('status_no_session'))[:8],
+            model=snapshot.get('model') or t('status_unknown'),
+            effort=snapshot.get('effort') or t('status_unknown'),
+            sandbox=snapshot.get('sandbox'),
+            workspace=snapshot.get('workspace'),
+            busy=t('status_yes') if runtime.busy or runtime.pending_batch else t('status_no'),
+            account_status=snapshot.get('account_status') or t('status_account_unlinked'),
+        ))
         return True
     if cmd == "usage":
         send_plain(chat_id, build_usage_report(runtime))
@@ -3732,7 +3683,7 @@ def handle_command(chat_id, command, runtime=None):
         with state_lock:
             thread_id = chat_state(state_key).get("thread_id")
         if not thread_id:
-            send_plain(chat_id, "Нет активной сессии для сжатия.")
+            send_plain(chat_id, t('compact_no_session'))
             return True
         with process_lock:
             if runtime.busy:
@@ -3741,7 +3692,7 @@ def handle_command(chat_id, command, runtime=None):
                 runtime.busy = True
                 already_busy = False
         if already_busy:
-            send_plain(chat_id, "Сначала дождись завершения текущего хода или используй /stop.")
+            send_plain(chat_id, t('compact_wait_for_turn'))
         else:
             threading.Thread(
                 target=run_compaction, args=(runtime, thread_id), daemon=True
@@ -3755,7 +3706,7 @@ def handle_command(chat_id, command, runtime=None):
                 return True
             chosen = resolve_model_choice(models, arg)
             if chosen is None:
-                send_rich(chat_id, f"Модель «{arg}» недоступна.\n\n{render_model_picker(runtime)}")
+                send_rich(chat_id, t('model_unavailable', model=arg, picker=render_model_picker(runtime)))
                 return True
             supported = supported_reasoning_efforts(chosen)
             current_effort = chat_state(state_key).get("effort")
@@ -3765,39 +3716,37 @@ def handle_command(chat_id, command, runtime=None):
                     or chat_state(state_key).get("effort") != effort):
                 cancel_pending_batch(runtime)
             update_state(state_key, model=model_key(chosen), effort=effort)
-            send_plain(chat_id, f"🧠 Модель: {chosen.get('displayName') or model_key(chosen)}\n"
-                       f"Мощность: {effort or 'не поддерживается'}")
+            send_plain(chat_id, t('model_selected', model=chosen.get('displayName') or model_key(chosen), effort=effort or t('effort_unsupported')))
         except Exception as exc:
-            send_plain(chat_id, f"Не удалось получить список моделей: {compact(str(exc), 500)}")
+            send_plain(chat_id, t('model_list_error', error=compact(str(exc), 500)))
         return True
     if cmd == "effort":
         try:
             models = available_models(runtime)
             chosen = selected_model(runtime, models)
             if not chosen:
-                send_plain(chat_id, "Codex не вернул доступных моделей.")
+                send_plain(chat_id, t('model_empty'))
                 return True
             if not arg:
                 send_rich(chat_id, render_effort_picker(runtime))
                 return True
             effort = resolve_effort_choice(chosen, arg)
             if effort is None:
-                send_rich(chat_id, f"Мощность «{arg}» недоступна для {model_key(chosen)}.\n\n"
-                          f"{render_effort_picker(runtime)}")
+                send_rich(chat_id, t('effort_unavailable', effort=arg, model=model_key(chosen), picker=render_effort_picker(runtime)))
                 return True
             if chat_state(state_key).get("effort") != effort:
                 cancel_pending_batch(runtime)
             update_state(state_key, effort=effort)
-            send_plain(chat_id, f"⚡ Мощность {chosen.get('displayName') or model_key(chosen)}: {effort}")
+            send_plain(chat_id, t('effort_selected', model=chosen.get('displayName') or model_key(chosen), effort=effort))
         except Exception as exc:
-            send_plain(chat_id, f"Не удалось получить уровни мощности: {compact(str(exc), 500)}")
+            send_plain(chat_id, t('effort_list_error', error=compact(str(exc), 500)))
         return True
     if cmd == "mode":
         aliases = {"read": "read-only", "read-only": "read-only", "write": "workspace-write",
                    "workspace-write": "workspace-write", "full": "danger-full-access",
                    "danger-full-access": "danger-full-access"}
         if arg not in aliases:
-            send_plain(chat_id, "Использование: /mode read-only|workspace-write|full")
+            send_plain(chat_id, t('mode_usage'))
         else:
             if chat_state(state_key).get("sandbox") != aliases[arg]:
                 cancel_pending_batch(runtime)
@@ -3807,9 +3756,9 @@ def handle_command(chat_id, command, runtime=None):
     if cmd == "workspace":
         path = CODEX_CWD if arg.lower() == "default" else os.path.abspath(os.path.expanduser(arg))
         if not arg:
-            send_plain(chat_id, f"Workspace: {chat_state(state_key).get('workspace')}\nИспользование: /workspace <путь>|default")
+            send_plain(chat_id, t('workspace_usage', workspace=chat_state(state_key).get('workspace')))
         elif not os.path.isdir(path):
-            send_plain(chat_id, f"Директория не существует: {path}")
+            send_plain(chat_id, t('workspace_missing', path=path))
         else:
             if chat_state(state_key).get("workspace") != path:
                 cancel_pending_batch(runtime)
@@ -3818,50 +3767,49 @@ def handle_command(chat_id, command, runtime=None):
         return True
     if cmd == "restart":
         if chat_id != OWNER_ID:
-            send_plain(chat_id, "Перезапуск доступен только владельцу бота.")
+            send_plain(chat_id, t('restart_owner_only'))
             return True
         cancel_pending_batch(runtime)
         request_restart(chat_id)
         return True
     if cmd == "update":
         if chat_id != OWNER_ID:
-            send_plain(chat_id, "Обновление доступно только владельцу бота.")
+            send_plain(chat_id, t('update_owner_only'))
             return True
         # /update configures the owner's shared local server, never a
         # currently selected delegated tenant.
         runtime = get_tenant(OWNER_ID)
         if runtime.update_flow_stage == "installing":
-            send_plain(chat_id, "Установка уже идёт, дождись.")
+            send_plain(chat_id, t('local_api_install_running'))
             return True
         cancel_pending_batch(runtime)
-        send_plain(chat_id, "⬇️ Обновляю из git...")
+        send_plain(chat_id, t('update_start'))
         script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.sh")
         try:
             result = subprocess.run(
                 [script_path], capture_output=True, text=True, timeout=120, check=False
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            send_plain(chat_id, f"❌ Обновление не удалось:\n```\n{compact(str(exc), 2000)}\n```")
+            send_plain(chat_id, t('update_failed', error=compact(str(exc), 2000)))
             return True
         if result.returncode != 0:
             failure = (result.stderr.strip() or result.stdout.strip() or
-                       f"update.sh завершился с кодом {result.returncode}")
-            send_plain(chat_id, f"❌ Обновление не удалось:\n```\n{failure[-2000:]}\n```")
+                       t("update_script_failed", code=result.returncode))
+            send_plain(chat_id, t('update_failed', error=failure[-2000:]))
             return True
         summary = next(
             (line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()),
-            "Обновление завершено.",
+            t("update_done_default_summary"),
         )
         configured_url = _configured_local_bot_api_url()
         if not configured_url:
             with process_lock:
                 runtime.update_flow_stage = "awaiting_yes_no"
                 runtime.update_flow_api_id = None
-            send_plain(chat_id, f"✅ {summary}")
+            send_plain(chat_id, t("update_summary_line", summary=summary))
             send_plain(
                 chat_id,
-                "Включить приём файлов до 2 ГБ через локальный Bot API сервер? "
-                "Ответь Да или Нет.",
+                t('local_api_offer'),
             )
             # The install itself only starts once the owner actually answers
             # "да" -- see handle_update_flow_message. Asking here and then
@@ -3872,20 +3820,20 @@ def handle_command(chat_id, command, runtime=None):
         request_restart(chat_id)
         suffix = f"\n{repair_status}" if repair_status else ""
         if runtime.busy or runtime.pending_batch:
-            send_plain(chat_id, f"✅ {summary}{suffix}\n🔁 Перезапуск запланирован после завершения текущего хода.")
+            send_plain(chat_id, t('update_restart_after_turn', summary=summary, suffix=suffix))
         else:
-            send_plain(chat_id, f"✅ {summary}{suffix}\n🔁 Перезапуск запланирован между ходами.")
+            send_plain(chat_id, t('update_restart_between_turns', summary=summary, suffix=suffix))
         return True
     if cmd == "stop":
         cancel_pending_batch(runtime)
         running = stop_current_process(runtime)
         if running:
-            send_plain(chat_id, "⏹ Останавливаю текущее выполнение Codex.")
+            send_plain(chat_id, t('stop_running'))
         else:
-            send_plain(chat_id, "Сейчас нечего останавливать.")
+            send_plain(chat_id, t('stop_idle'))
         return True
     if raw_cmd.startswith(("/", ".")):
-        send_plain(chat_id, "Неизвестная команда. Открой меню команд Telegram.")
+        send_plain(chat_id, t('command_unknown'))
         return True
     return False
 
@@ -3899,7 +3847,7 @@ def process_message_inputs(runtime, message):
         send_plain(chat_id, str(exc))
         return
     except Exception as exc:
-        send_plain(chat_id, f"Не смог обработать вложение: {compact(str(exc), 500)}")
+        send_plain(chat_id, t('attachment_processing_error', error=compact(str(exc), 500)))
         return
     for failure in attachment_failures:
         send_plain(chat_id, str(failure))
@@ -3933,7 +3881,7 @@ def _update_download_status(queue_state, runtime, force=False):
     chat_id = runtime.chat_id
     total = queue_state["total"]
     done = queue_state["done"]
-    text = f"📥 Загружаю вложение ({done}/{total})…" if total > 1 else "📥 Загружаю вложение…"
+    text = t("attachment_loading_progress", done=done, total=total) if total > 1 else t("attachment_loading")
     now = time.monotonic()
     msg_id = queue_state["status_msg_id"]
     if msg_id is None:
@@ -4033,7 +3981,7 @@ def handle_message(message):
     user_id = message.get("from", {}).get("id")
     if str(user_id) not in load_whitelist():
         if chat_id:
-            send_plain(chat_id, "⛔ Доступ к Codex-боту не разрешён. Попроси владельца добавить твой Telegram ID в whitelist.txt.")
+            send_plain(chat_id, t('access_denied'))
         return
     owner_runtime = get_tenant(chat_id)
     raw_text = (
@@ -4051,7 +3999,7 @@ def handle_message(message):
     with process_lock:
         draining = restart_draining
     if draining:
-        send_plain(chat_id, "🔄 Уже начинаю перезапуск; сообщение пока не принято.")
+        send_plain(chat_id, t('restart_in_progress'))
         return
     # A reply target, rather than message ordering, authorizes persona edits.
     # Handle it before update/command/Codex routing so the content is never a
@@ -4078,7 +4026,7 @@ def handle_message(message):
     if (chat_id != OWNER_ID and account_status != "ready"
             and (account_status == "awaiting_display_name" or not account_is_ready(runtime))):
         if account_status == "awaiting_login":
-            send_plain(chat_id, "Сначала заверши вход в Codex по ранее выданной ссылке.")
+            send_plain(chat_id, t('login_complete_first'))
         elif account_status == "awaiting_display_name":
             tenant_dir = tenant_codex_home(chat_id)
             if tenant_dir is not None:
@@ -4090,7 +4038,7 @@ def handle_message(message):
                 else:
                     agents_path.write_text(personality.replace("<user>", text), encoding="utf-8")
             update_state(runtime.state_key, account_status="ready")
-            send_plain(chat_id, "✅ Запомнил, как к тебе обращаться.")
+            send_plain(chat_id, t('name_remembered'))
         else:
             threading.Thread(target=start_account_login, args=(runtime,), daemon=True).start()
         return
@@ -4124,12 +4072,12 @@ def main():
         if completed_restart_message_id:
             result = edit_plain(
                 completed_restart_chat_id, completed_restart_message_id,
-                "✅ Перезагрузка окончена, бот готов к работе.",
+                t('restart_complete'),
             )
             if not result.get("ok"):
-                send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
+                send_plain(completed_restart_chat_id, t('restart_complete'))
         else:
-            send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
+            send_plain(completed_restart_chat_id, t('restart_complete'))
     try:
         owner_runtime = get_tenant(OWNER_ID)
         get_app_server(owner_runtime).start_if_needed()
@@ -4162,7 +4110,7 @@ def main():
                 log(f"Unexpected update handler error: {exc}")
                 chat_id = (update.get("message") or {}).get("chat", {}).get("id")
                 if chat_id == OWNER_ID:
-                    send_plain(chat_id, "⚠️ Ошибка моста. Подробности записаны в лог.")
+                    send_plain(chat_id, t('bridge_error'))
 
 
 if __name__ == "__main__":
