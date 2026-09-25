@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from app_server import AppServerClient, AppServerError
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
 from strings import COMMAND_DESCRIPTIONS, current_language, t
+from tenant_migration import apply_pending_tenant_migration
 
 
 EDIT_THROTTLE_S = 1.3
@@ -913,6 +914,7 @@ def message_inputs(message):
 
 
 def load_state():
+    apply_pending_tenant_migration(STATE_FILE, WHITELIST_FILE, ACCOUNTS_DIR, OWNER_ID)
     if not STATE_FILE.exists():
         return {"version": 2, "chats": {}, "runtime": {}}
     try:

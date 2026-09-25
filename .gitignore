@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 state.json
 restart.request
+.tenant-id-migration.json
+.tenant-id-migration-backups/
 last_turn_*.json
 external_request.json
 external_request.json.delegate.lock

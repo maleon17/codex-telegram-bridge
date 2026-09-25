@@ -85,6 +85,11 @@ for a starting point.
 
 Multi-account: a whitelist file gates access; each non-owner user gets an
 isolated `CODEX_HOME` under the accounts dir with its own `codex login`.
+When a tenant's Telegram ID changes, `.tenant-id-migration.json` is applied
+before state loads on the next deferred restart. The migration first backs up
+the account, state and whitelist, then moves the tenant home and workspace and
+updates session-index paths. Do not edit `state.json` while the bot is running:
+the live process would overwrite it from memory.
 
 `/language en|ru|uk|kk|de` stores an interface language per chat, updates that
 chat's Telegram command menu, and changes its `AGENTS.md` persona. Bot-authored
