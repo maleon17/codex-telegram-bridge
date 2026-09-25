@@ -131,6 +131,8 @@ Do not place a bot token in a shell command, service unit, or repository file.
 
 | Command | Description |
 |---|---|
+| `/language en\|ru\|uk\|kk\|de` | Set this chat's interface and persona language; the Telegram command menu follows the selection |
+| `/persona` / `/persona reset` | Owner-only: show or reset the chat persona |
 | `/new` | Start a new Codex thread |
 | `/sessions` | List recent threads for this account |
 | `/resume <id>` | Resume by full ID or unique prefix |

@@ -3,7 +3,7 @@ from collections import Counter
 from string import Formatter
 import unittest
 
-from strings import STRINGS, current_language, t
+from strings import COMMAND_DESCRIPTIONS, STRINGS, current_language, t
 
 
 class StringCatalogTests(unittest.TestCase):
@@ -54,6 +54,13 @@ class StringCatalogTests(unittest.TestCase):
             contextvars.Context().run(t, "persona_updated"),
             STRINGS["ru"]["persona_updated"],
         )
+
+    def test_command_descriptions_cover_every_language(self):
+        self.assertEqual(set(COMMAND_DESCRIPTIONS), set(STRINGS))
+        source = set(COMMAND_DESCRIPTIONS["ru"])
+        for language, descriptions in COMMAND_DESCRIPTIONS.items():
+            self.assertEqual(set(descriptions), source, language)
+            self.assertTrue(all(3 <= len(value) <= 256 for value in descriptions.values()))
 
 
 if __name__ == "__main__":

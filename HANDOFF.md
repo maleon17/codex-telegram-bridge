@@ -86,6 +86,11 @@ for a starting point.
 Multi-account: a whitelist file gates access; each non-owner user gets an
 isolated `CODEX_HOME` under the accounts dir with its own `codex login`.
 
+`/language en|ru|uk|kk|de` stores an interface language per chat, updates that
+chat's Telegram command menu, and changes its `AGENTS.md` persona. Bot-authored
+messages are translated through `strings.py`; customized personas stay isolated
+and are translated without being shared with other tenants.
+
 ## Self-test: adversarial tester + userbot test channel
 
 - **`breaker` subagent** — a coding-agent subagent whose only mandate is to

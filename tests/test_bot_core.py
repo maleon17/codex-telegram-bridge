@@ -848,7 +848,7 @@ class DelegationTests(unittest.TestCase):
             json.loads(
                 Path(bridge_exec.last_turn_path(bot.OWNER_ID, delegated=True)).read_text()
             )["text"],
-            "готово\n\nТвой session id (до делегации): `owner-th`. Продолжить делегированную: `/resume delegate`",
+            "готово\n\nТвой ID сессии до делегирования: `owner-th`. Продолжить делегированную сессию: `/resume delegate`",
         )
 
     def test_bridge_exec_uses_a_signal_separate_from_owner_turns(self):

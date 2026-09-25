@@ -37,6 +37,9 @@ for _name, _value in _OLD_ENV.items():
 
 class PersonaCommandTests(unittest.TestCase):
     def setUp(self):
+        menu_patcher = patch.object(bot, "tg_call", return_value={"ok": True})
+        menu_patcher.start()
+        self.addCleanup(menu_patcher.stop)
         bot.tenants.clear()
         bot.update_state(bot.OWNER_ID, language="ru")
         bot.persona_message_ids.clear() if hasattr(bot, "persona_message_ids") else None
@@ -167,25 +170,56 @@ class PersonaCommandTests(unittest.TestCase):
             self.assertTrue(bot._persona_is_default(chat_id))
 
     def test_language_switch_reseeds_default_persona(self):
+        sent, edited = [], []
+
+        def send(chat_id, text):
+            message_id = 100 + len(sent)
+            sent.append((chat_id, text, message_id))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        def edit(chat_id, message_id, text):
+            edited.append((chat_id, message_id, text))
+            return {"ok": True}
+
         with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
-                patch.object(bot, "send_plain") as send, \
+                patch.object(bot, "send_plain", side_effect=send), \
+                patch.object(bot, "edit_plain", side_effect=edit), \
                 patch.object(bot, "_translate_persona_file", side_effect=AssertionError("custom path used")):
             bot._seed_default_persona(bot.OWNER_ID, "ru")
-            self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language EN"))
-            expected = (ROOT / "personality.example.en.md").read_text(encoding="utf-8")
-            path = bot._persona_path(bot.OWNER_ID)
-            self.assertEqual(path.read_text(encoding="utf-8"), expected)
-            self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text().strip(),
-                             hashlib.sha256(expected.encode()).hexdigest())
-            self.assertTrue(bot._persona_is_default(bot.OWNER_ID))
-            self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], "en")
-            self.assertIn("English", send.call_args.args[1])
+            for code in ("en", "de", "uk", "kk", "ru"):
+                command_code = "EN" if code == "en" else code
+                self.assertTrue(bot.handle_command(bot.OWNER_ID, f"/language {command_code}"))
+                name = "personality.example.md" if code == "ru" else f"personality.example.{code}.md"
+                expected = (ROOT / name).read_text(encoding="utf-8")
+                path = bot._persona_path(bot.OWNER_ID)
+                self.assertEqual(path.read_text(encoding="utf-8"), expected)
+                self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text().strip(),
+                                 hashlib.sha256(expected.encode()).hexdigest())
+                self.assertTrue(bot._persona_is_default(bot.OWNER_ID))
+                self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], code)
+                self.assertEqual(sent[-1][1], bot.t("language_progress", lang=code))
+                self.assertEqual(edited[-1], (
+                    bot.OWNER_ID, sent[-1][2], bot.t("language_changed", lang=code),
+                ))
+                self.assertNotIn("Russian", edited[-1][2])
 
     def test_language_switch_translates_custom_persona_and_keeps_it_on_failure(self):
         custom = "# Persona\nAlways answer in Russian. Speak plainly and keep this distinctive tone.\n"
         translated = "# Persona\nAlways answer in German. Speak plainly and keep this distinctive tone.\n"
+        events = []
+
+        def send(chat_id, text):
+            message_id = 200 + len(events)
+            events.append(("send", chat_id, message_id, text))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        def edit(chat_id, message_id, text):
+            events.append(("edit", chat_id, message_id, text))
+            return {"ok": True}
+
         with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
-                patch.object(bot, "send_plain") as send:
+                patch.object(bot, "send_plain", side_effect=send), \
+                patch.object(bot, "edit_plain", side_effect=edit):
             bot._seed_default_persona(bot.OWNER_ID, "ru")
             path = bot._persona_path(bot.OWNER_ID)
             bot._write_persona(path, custom)
@@ -193,6 +227,9 @@ class PersonaCommandTests(unittest.TestCase):
             self.assertFalse(bot._persona_is_default(bot.OWNER_ID))
 
             def translated_run(command, **kwargs):
+                self.assertEqual(events[-1][0], "send")
+                self.assertEqual(events[-1][3], bot.t("language_progress", lang="de"))
+                events.append(("translate",))
                 self.assertIn("--ephemeral", command)
                 self.assertIn("read-only", command)
                 self.assertIn("--ignore-user-config", command)
@@ -207,16 +244,27 @@ class PersonaCommandTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), translated)
             self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text(), marker)
             self.assertFalse(bot._persona_is_default(bot.OWNER_ID))
-            self.assertIn("German", send.call_args.args[1])
+            self.assertEqual([event[0] for event in events[-3:]], ["send", "translate", "edit"])
+            self.assertEqual(events[-1], (
+                "edit", bot.OWNER_ID, events[-3][2], bot.t("language_changed", lang="de"),
+            ))
 
             before = path.read_text(encoding="utf-8")
-            with patch.object(bot.subprocess, "run", return_value=SimpleNamespace(
-                    returncode=1, stderr="translation failed", stdout="")):
+            def failed_run(*args, **kwargs):
+                self.assertEqual(events[-1][3], bot.t("language_progress", lang="uk"))
+                events.append(("translate",))
+                return SimpleNamespace(returncode=1, stderr="translation failed", stdout="")
+
+            with patch.object(bot.subprocess, "run", side_effect=failed_run):
                 self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language uk"))
             self.assertEqual(path.read_text(encoding="utf-8"), before)
             self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text(), marker)
             self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], "uk")
-            self.assertIn("translation failed", send.call_args.args[1])
+            self.assertEqual([event[0] for event in events[-3:]], ["send", "translate", "edit"])
+            self.assertEqual(events[-1], (
+                "edit", bot.OWNER_ID, events[-3][2],
+                bot.t("language_persona_failed", lang="uk", error="translation failed"),
+            ))
 
     def test_invalid_language_preserves_state_and_persona(self):
         with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
@@ -227,6 +275,37 @@ class PersonaCommandTests(unittest.TestCase):
             self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], "ru")
             self.assertEqual(bot._persona_path(bot.OWNER_ID).read_bytes(), before)
             self.assertIn("/language", send.call_args.args[1])
+
+    def test_menu_follows_saved_chat_language(self):
+        bot.update_state(bot.OWNER_ID, language="uk")
+        with patch.object(bot, "tg_call", return_value={"ok": True}) as telegram:
+            bot.register_commands()
+        scoped = [call.args[1] for call in telegram.call_args_list
+                  if call.args[0] == "setMyCommands" and call.args[1].get("scope") ==
+                  {"type": "chat", "chat_id": bot.OWNER_ID}]
+        self.assertEqual(len(scoped), 1)
+        self.assertEqual(scoped[0]["commands"][0]["description"],
+                         bot.COMMAND_DESCRIPTIONS["uk"]["new"])
+
+    def test_usage_labels_follow_chat_language(self):
+        runtime = SimpleNamespace(chat_id=bot.OWNER_ID, state_key=bot.OWNER_ID,
+                                  last_rate_limits=None)
+        client = SimpleNamespace(request=lambda method, *args, **kwargs: (
+            {"rateLimits": {"primary": {"usedPercent": 3},
+                            "secondary": {"usedPercent": 5},
+                            "credits": {"unlimited": True}}}
+            if method == "account/rateLimits/read" else {}))
+        bot.update_state(bot.OWNER_ID, model="gpt-test")
+        with patch.object(bot, "get_app_server", return_value=client), \
+                patch.object(bot, "session_message_count", return_value=42):
+            for language in ("ru", "en", "uk", "kk", "de"):
+                bot.update_state(bot.OWNER_ID, language=language)
+                bot._set_chat_language(bot.OWNER_ID)
+                report = bot.build_usage_report(runtime)
+                self.assertIn(bot.t("usage_session_header", lang=language), report)
+                self.assertIn(bot.t("usage_window_5h", lang=language), report)
+                self.assertIn(bot.t("usage_window_weekly", lang=language), report)
+                self.assertIn(bot.t("usage_unlimited", lang=language), report)
 
 
 if __name__ == "__main__":

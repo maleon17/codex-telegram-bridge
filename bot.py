@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 
 from app_server import AppServerClient, AppServerError
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
-from strings import current_language, t
+from strings import COMMAND_DESCRIPTIONS, current_language, t
 
 
 EDIT_THROTTLE_S = 1.3
@@ -38,25 +38,7 @@ TELEGRAM_CLOUD_FILE_MAX_BYTES = 20 * 1024 * 1024
 IDLE_TIMEOUT_S = 300
 TOTAL_TIMEOUT_S = 1800
 LOCAL_BOT_API_STATUS_EDIT_MIN_INTERVAL_S = 1.0
-COMMANDS = [
-    ("new", "Начать новую Codex-сессию"),
-    ("sessions", "Список последних сессий"),
-    ("resume", "Продолжить сессию по id"),
-    ("status", "Сессия, модель, sandbox и workspace"),
-    ("stop", "Прервать текущий запрос"),
-    ("usage", "Токены последнего запроса"),
-    ("compact", "Сжать контекст текущей сессии"),
-    ("model", "Выбрать модель Codex"),
-    ("effort", "Выбрать мощность модели"),
-    ("mode", "Sandbox: read-only/workspace-write/full"),
-    ("workspace", "Рабочая директория"),
-    ("account", "Состояние аккаунта Codex"),
-    ("login", "Подключить свой аккаунт Codex"),
-    ("persona", "Показать или сбросить персону владельца"),
-    ("language", t("language_command_description")),
-    ("restart", "Перезапустить Codex-бота"),
-    ("update", "Обновить бота из git и перезапустить"),
-]
+COMMANDS = tuple(COMMAND_DESCRIPTIONS["ru"].items())
 
 
 def log(message):
@@ -1444,6 +1426,17 @@ def edit_plain(chat_id, message_id, text):
     })
 
 
+def _finish_language_message(chat_id, progress, message):
+    message_id = (progress.get("result") or {}).get("message_id") if isinstance(progress, dict) and progress.get("ok") else None
+    if isinstance(message_id, int) and not isinstance(message_id, bool):
+        try:
+            if edit_plain(chat_id, message_id, message).get("ok"):
+                return
+        except Exception as exc:
+            log(f"chat={chat_id} could not edit language progress: {exc}")
+    send_plain(chat_id, message)
+
+
 def split_rich_text(markdown_text, limit=RICH_MAX_CHARS):
     """Split final rich text at paragraphs/lines while balancing fenced code."""
     text = str(markdown_text or "")
@@ -2803,11 +2796,11 @@ def build_usage_report(runtime):
         plan = limits.get("planType")
         if plan:
             lines.append(t("usage_plan_line", plan=str(plan).replace('_', ' ').title()))
-        lines.append(rate_limit_line("5-hour", limits.get("primary")))
-        lines.append(rate_limit_line("Weekly", limits.get("secondary")))
+        lines.append(rate_limit_line(t("usage_window_5h"), limits.get("primary")))
+        lines.append(rate_limit_line(t("usage_window_weekly"), limits.get("secondary")))
         credits = limits.get("credits") or {}
         if credits.get("hasCredits") or credits.get("unlimited"):
-            balance = "unlimited" if credits.get("unlimited") else credits.get("balance")
+            balance = t("usage_unlimited") if credits.get("unlimited") else credits.get("balance")
             lines.append(t("usage_credits_line", balance=balance))
     else:
         lines.append(t("usage_limits_failed", error=limits_error or t("usage_no_data")))
@@ -3714,6 +3707,8 @@ def handle_command(chat_id, command, runtime=None):
             return True
         update_state(chat_id, language=code)
         current_language.set(code)
+        set_chat_commands(chat_id, code)
+        progress = send_plain(chat_id, t('language_progress'))
         try:
             if _persona_is_default(chat_id):
                 _seed_default_persona(chat_id, code)
@@ -3721,9 +3716,9 @@ def handle_command(chat_id, command, runtime=None):
                 _translate_persona_file(chat_id, code)
         except Exception as exc:
             log(f"chat={chat_id} persona language switch failed: {exc}")
-            send_plain(chat_id, t('language_persona_failed', language=LANGUAGE_NAMES[code], error=compact(str(exc), 500)))
+            _finish_language_message(chat_id, progress, t('language_persona_failed', error=compact(str(exc), 500)))
             return True
-        send_plain(chat_id, t('language_changed', language=LANGUAGE_NAMES[code]))
+        _finish_language_message(chat_id, progress, t('language_changed'))
         return True
     if cmd == "persona":
         if chat_id != OWNER_ID:
@@ -3886,7 +3881,7 @@ def handle_command(chat_id, command, runtime=None):
             if chat_state(state_key).get("sandbox") != aliases[arg]:
                 cancel_pending_batch(runtime)
             update_state(state_key, sandbox=aliases[arg])
-            send_plain(chat_id, f"Sandbox: {aliases[arg]}.")
+            send_plain(chat_id, t('mode_selected', mode=aliases[arg]))
         return True
     if cmd == "workspace":
         path = CODEX_CWD if arg.lower() == "default" else os.path.abspath(os.path.expanduser(arg))
@@ -3898,7 +3893,7 @@ def handle_command(chat_id, command, runtime=None):
             if chat_state(state_key).get("workspace") != path:
                 cancel_pending_batch(runtime)
             update_state(state_key, workspace=path)
-            send_plain(chat_id, f"Workspace: {path}")
+            send_plain(chat_id, t('workspace_selected', path=path))
         return True
     if cmd == "restart":
         if chat_id != OWNER_ID:
@@ -4192,10 +4187,35 @@ def handle_message(message):
     process_message_inputs(runtime, message)
 
 
+def _command_payload(language):
+    descriptions = COMMAND_DESCRIPTIONS[language]
+    return {"commands": [
+        {"command": command, "description": descriptions[command]} for command, _ in COMMANDS
+    ]}
+
+
+def set_chat_commands(chat_id, language):
+    tg_call("setMyCommands", {
+        **_command_payload(language), "scope": {"type": "chat", "chat_id": chat_id},
+    })
+
+
 def register_commands():
-    payload = {"commands": [{"command": c, "description": d} for c, d in COMMANDS]}
-    tg_call("setMyCommands", payload)
-    tg_call("setMyCommands", {**payload, "scope": {"type": "all_private_chats"}})
+    for language in COMMAND_DESCRIPTIONS:
+        payload = _command_payload(language)
+        for scope in (None, {"type": "all_private_chats"}):
+            params = {**payload, "language_code": language}
+            if scope:
+                params["scope"] = scope
+            tg_call("setMyCommands", params)
+            if language == "ru":
+                tg_call("setMyCommands", {**payload, **({"scope": scope} if scope else {})})
+    with state_lock:
+        chats = [(int(chat_id), data.get("language", "ru"))
+                 for chat_id, data in state_db["chats"].items()
+                 if chat_id.isdecimal() and data.get("language", "ru") in COMMAND_DESCRIPTIONS]
+    for chat_id, language in chats:
+        set_chat_commands(chat_id, language)
 
 
 def main():
