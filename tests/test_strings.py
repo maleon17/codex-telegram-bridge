@@ -1,4 +1,6 @@
 import contextvars
+from collections import Counter
+from string import Formatter
 import unittest
 
 from strings import STRINGS, current_language, t
@@ -24,15 +26,28 @@ class StringCatalogTests(unittest.TestCase):
 
     def test_context_language_and_explicit_override(self):
         sentinel = "CONTEXT TRANSLATION"
+        original = STRINGS["en"]["persona_updated"]
         STRINGS["en"]["persona_updated"] = sentinel
         token = current_language.set("en")
         try:
             self.assertEqual(t("persona_updated"), sentinel)
-            self.assertEqual(t("persona_empty"), STRINGS["ru"]["persona_empty"])
+            self.assertEqual(t("persona_empty"), STRINGS["en"]["persona_empty"])
             self.assertEqual(t("persona_updated", lang="ru"), STRINGS["ru"]["persona_updated"])
         finally:
             current_language.reset(token)
-            del STRINGS["en"]["persona_updated"]
+            STRINGS["en"]["persona_updated"] = original
+
+    def test_translations_have_same_keys_and_placeholders(self):
+        formatter = Formatter()
+        source = STRINGS["ru"]
+        for language in ("en", "uk", "kk", "de"):
+            translated = STRINGS[language]
+            self.assertEqual(set(translated), set(source), language)
+            for key, original in source.items():
+                with self.subTest(language=language, key=key):
+                    source_fields = Counter(name for _, name, _, _ in formatter.parse(original) if name)
+                    translated_fields = Counter(name for _, name, _, _ in formatter.parse(translated[key]) if name)
+                    self.assertEqual(translated_fields, source_fields)
 
     def test_fresh_context_defaults_to_russian(self):
         self.assertEqual(
