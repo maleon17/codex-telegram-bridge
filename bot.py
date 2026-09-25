@@ -2,6 +2,7 @@
 """Single-owner Telegram frontend for persistent Codex CLI conversations."""
 
 import json
+import hashlib
 import mimetypes
 import os
 import re
@@ -22,7 +23,7 @@ from urllib.parse import urlsplit
 
 from app_server import AppServerClient, AppServerError
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
-from strings import t
+from strings import current_language, t
 
 
 EDIT_THROTTLE_S = 1.3
@@ -52,6 +53,7 @@ COMMANDS = [
     ("account", "Состояние аккаунта Codex"),
     ("login", "Подключить свой аккаунт Codex"),
     ("persona", "Показать или сбросить персону владельца"),
+    ("language", t("language_command_description")),
     ("restart", "Перезапустить Codex-бота"),
     ("update", "Обновить бота из git и перезапустить"),
 ]
@@ -169,6 +171,96 @@ FILE_SEND_AGENTS_SECTION = """
 Не пытайся искать или использовать токен Telegram: этот тул отправляет файл
 только в текущий чат и не раскрывает секреты бота.
 """.strip()
+LANGUAGE_NAMES = {
+    "en": "English", "ru": "Russian", "uk": "Ukrainian",
+    "kk": "Kazakh", "de": "German",
+}
+
+
+def _set_chat_language(chat_id):
+    current_language.set(chat_state(real_chat_id(chat_id)).get("language", "ru"))
+
+
+def _persona_template(language):
+    name = "personality.example.md" if language == "ru" else f"personality.example.{language}.md"
+    return Path(__file__).with_name(name).read_text(encoding="utf-8")
+
+
+def _persona_marker_path(chat_id):
+    return ACCOUNTS_DIR / str(int(chat_id)) / ".persona_default_sha256"
+
+
+def _mark_default_persona(chat_id, contents):
+    _write_persona(_persona_marker_path(chat_id), hashlib.sha256(contents.encode("utf-8")).hexdigest() + "\n")
+
+
+def _persona_is_default(chat_id):
+    try:
+        contents = _persona_path(chat_id).read_bytes()
+        marker = _persona_marker_path(chat_id).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return False
+    return hashlib.sha256(contents).hexdigest() == marker
+
+
+def _seed_default_persona(chat_id, language):
+    contents = _persona_template(language)
+    _write_persona(_persona_path(chat_id), contents)
+    _mark_default_persona(chat_id, contents)
+
+
+def _translate_persona_file(chat_id, target_lang):
+    """Translate through this tenant's ephemeral, read-only Codex process."""
+    path = _persona_path(chat_id)
+    original = path.read_text(encoding="utf-8")
+    if not original.strip():
+        raise ValueError("persona is empty")
+    tenant_home = path.parent
+    language = LANGUAGE_NAMES[target_lang]
+    prompt = (
+        f"Translate the following AGENTS.md content into {language}. Preserve its "
+        "structure, tone and meaning faithfully; do not summarize or reword. "
+        f"If it instructs the agent to always answer in a named language, change "
+        f"that instruction to always answer in {language}. Output only the "
+        "translated file content, with no commentary, code fences or extra text. "
+        "Do not use tools or access files. The source text follows:\n\n"
+        + original
+    )
+    with tempfile.TemporaryDirectory(prefix="persona-translation-") as temporary:
+        output_path = Path(temporary) / "result.md"
+        translation_env = {
+            key: value for key, value in os.environ.items()
+            if key != "TELEGRAM_BOT_TOKEN" and not key.startswith("CODEX_BOT_")
+        }
+        translation_env["CODEX_HOME"] = str(tenant_home)
+        command = [
+            "codex", "exec", "--ephemeral", "--ignore-user-config",
+            "--sandbox", "read-only", "--skip-git-repo-check",
+            # read-only only gates shell/filesystem access, not MCP tool
+            # calls -- this turn must never actually invoke
+            # delegate-to-claude/send-telegram-file, only translate text.
+            "-c", "mcp_servers={}",
+            "--output-last-message", str(output_path), "-C", str(tenant_home), "-",
+        ]
+        selected_model = chat_state(chat_id).get("model")
+        if selected_model:
+            command[2:2] = ["--model", selected_model]
+        result = subprocess.run(
+            command, input=prompt, capture_output=True, text=True,
+            timeout=180, check=False,
+            env=translation_env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(compact(result.stderr or result.stdout or "Codex failed", 500))
+        translated = output_path.read_text(encoding="utf-8").strip()
+    refusal = re.match(r"(?i)^(?:sorry|i cannot|i can't|unable to)\b", translated)
+    original_has_headings = any(line.startswith("#") for line in original.splitlines())
+    translated_has_headings = any(line.startswith("#") for line in translated.splitlines())
+    if (len(translated) < max(12, len(original.strip()) // 3)
+            or translated.startswith("```") or translated.endswith("```")
+            or refusal or (original_has_headings and not translated_has_headings)):
+        raise ValueError("Codex returned incomplete persona content")
+    _write_persona(path, translated + "\n")
 
 
 def delegate_key(chat_id):
@@ -337,7 +429,8 @@ def _ensure_tenant_file_send_instructions(agents_path):
         content = agents_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return
-    if FILE_SEND_AGENTS_MARKER in content:
+    if (FILE_SEND_AGENTS_MARKER in content
+            or ("CODEX_TELEGRAM_OUTBOX" in content and "send_telegram_file" in content)):
         return
     agents_path.write_text(
         content.rstrip() + "\n\n" + FILE_SEND_AGENTS_SECTION + "\n",
@@ -385,6 +478,7 @@ def tenant_codex_home(chat_id, state_key=None):
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     agents_path = path / "AGENTS.md"
     owner = chat_id == OWNER_ID
+    seeded_default = False
     if not agents_path.exists():
         persona_source = (
             default_codex_home() / "AGENTS.md"
@@ -392,6 +486,7 @@ def tenant_codex_home(chat_id, state_key=None):
         )
         if persona_source.exists():
             shutil.copyfile(persona_source, agents_path)
+            seeded_default = not owner
         else:
             agents_path.touch(mode=0o600)
         if owner:
@@ -416,6 +511,8 @@ def tenant_codex_home(chat_id, state_key=None):
     # working knowledge of the send-telegram-file MCP tool it was just
     # given access to. This does not touch the rest of a /persona rewrite.
     _ensure_tenant_file_send_instructions(agents_path)
+    if seeded_default:
+        _mark_default_persona(chat_id, agents_path.read_text(encoding="utf-8"))
     try:
         _ensure_tenant_mcp_config(path, chat_id)
     except Exception as exc:
@@ -962,6 +1059,7 @@ def _deliver_pending(state_key, delivery, progress_message_id=None):
 
 
 def _deliver_pending_exclusive(state_key, delivery, progress_message_id):
+    _set_chat_language(state_key)
     chat_id, answer = delivery.get("chat_id"), delivery.get("text")
     if not isinstance(chat_id, int) or not isinstance(answer, str):
         update_state(state_key, pending_delivery=None)
@@ -1482,7 +1580,10 @@ def send_document(chat_id, path, caption=""):
 
 
 def _persona_path(chat_id):
-    return tenant_codex_home(chat_id) / "AGENTS.md"
+    path = ACCOUNTS_DIR / str(int(chat_id)) / "AGENTS.md"
+    if not path.exists():
+        tenant_codex_home(chat_id)
+    return path
 
 
 def _write_persona(path, contents):
@@ -1651,6 +1752,7 @@ def process_file_send_queue():
     """Send approved outbox files requested through tenant MCP processes."""
     FILE_SEND_QUEUE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     for request_path in sorted(FILE_SEND_QUEUE_DIR.glob("*.json")):
+        current_language.set("ru")
         request_id = request_path.stem
         try:
             request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -1669,6 +1771,10 @@ def process_file_send_queue():
             message = t("file_send_malformed_request")
         else:
             chat_id = request.get("chat_id")
+            if isinstance(chat_id, int) and not isinstance(chat_id, bool):
+                _set_chat_language(chat_id)
+            else:
+                current_language.set("ru")
             path = request.get("path")
             caption = request.get("caption", "")
             if not isinstance(chat_id, int) or isinstance(chat_id, bool):
@@ -2073,6 +2179,7 @@ def _usage_for_renderer(token_usage):
 
 
 def handle_app_notification(runtime, method, params):
+    _set_chat_language(runtime.chat_id)
     if method == "account/rateLimits/updated":
         update = params.get("rateLimits") or {}
         with process_lock:
@@ -2363,6 +2470,7 @@ def sandbox_policy(name, workspace):
 
 
 def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None):
+    _set_chat_language(runtime.chat_id)
     chat_id = runtime.chat_id
     view = TurnView(chat_id, state_key=runtime.state_key, progress_msg_id=progress_msg_id)
     done = threading.Event()
@@ -2483,6 +2591,7 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
 
 
 def run_compaction(runtime, thread_id):
+    _set_chat_language(runtime.chat_id)
     chat_id = runtime.chat_id
     view = TurnView(chat_id, state_key=runtime.state_key)
     done = threading.Event()
@@ -2751,6 +2860,7 @@ def restart_watcher():
             chat_id = (request.get("chat_id") if isinstance(request, dict) else None) or OWNER_ID
         except Exception:
             chat_id = OWNER_ID
+        _set_chat_language(chat_id)
         try:
             RESTART_SIGNAL_FILE.unlink()
         except FileNotFoundError:
@@ -2843,6 +2953,7 @@ def cross_delegate_watcher():
     while True:
         time.sleep(0.5)
         for request_path in sorted(CROSS_DELEGATE_QUEUE_DIR.glob("*.json")):
+            current_language.set("ru")
             request_id = request_path.stem
             try:
                 request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -2861,6 +2972,10 @@ def cross_delegate_watcher():
                 result_text = t("cross_delegate_malformed_request")
             else:
                 chat_id = request.get("chat_id")
+                if isinstance(chat_id, int) and not isinstance(chat_id, bool):
+                    _set_chat_language(chat_id)
+                else:
+                    current_language.set("ru")
                 text = request.get("text")
                 if not isinstance(chat_id, int) or isinstance(chat_id, bool):
                     result_text = t("cross_delegate_bad_chat_id")
@@ -3026,6 +3141,7 @@ def _requeue_batch(runtime, entries, delay=BATCH_RETRY_S):
 
 def flush_pending_batch(runtime, timer, generation):
     """Start the one turn represented by the current debounce window."""
+    _set_chat_language(runtime.chat_id)
     with process_lock:
         # A canceled timer can still wake up concurrently.  Only the newest
         # timer that is still registered for this chat may consume the batch.
@@ -3105,6 +3221,7 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
                         model=None, effort=None, env=None):
     """Start a delegated turn in the real chat's isolated delegate tenant."""
     chat_id = int(chat_id)
+    _set_chat_language(chat_id)
     runtime = get_delegate_tenant(chat_id)
     requested_thread_id = str(resume_thread_id or "").strip() or None
     requested_env = dict(env or {})
@@ -3240,6 +3357,7 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
 
 
 def start_account_login(runtime):
+    _set_chat_language(runtime.chat_id)
     if runtime.chat_id == OWNER_ID:
         send_plain(runtime.chat_id, t('login_owner_not_needed'))
         return
@@ -3375,6 +3493,7 @@ def _write_telegram_api_url(url):
 
 def _run_local_bot_api_install(runtime, api_id=None, api_hash=None):
     """Worker for the build/reuse and irreversible API endpoint switch."""
+    _set_chat_language(runtime.chat_id)
     status = {
         "chat_id": runtime.chat_id,
         "message_id": None,
@@ -3579,6 +3698,7 @@ def handle_update_flow_message(chat_id, text, runtime):
 
 
 def handle_command(chat_id, command, runtime=None):
+    _set_chat_language(chat_id)
     runtime = runtime or get_tenant(chat_id)
     state_key = runtime.state_key
     raw_cmd, _, arg = command.partition(" ")
@@ -3587,15 +3707,30 @@ def handle_command(chat_id, command, runtime=None):
     if cmd in ("start", "help"):
         send_plain(chat_id, t('help_intro'))
         return True
+    if cmd == "language":
+        code = arg.lower()
+        if code not in LANGUAGE_NAMES:
+            send_plain(chat_id, t('language_usage'))
+            return True
+        update_state(chat_id, language=code)
+        current_language.set(code)
+        try:
+            if _persona_is_default(chat_id):
+                _seed_default_persona(chat_id, code)
+            else:
+                _translate_persona_file(chat_id, code)
+        except Exception as exc:
+            log(f"chat={chat_id} persona language switch failed: {exc}")
+            send_plain(chat_id, t('language_persona_failed', language=LANGUAGE_NAMES[code], error=compact(str(exc), 500)))
+            return True
+        send_plain(chat_id, t('language_changed', language=LANGUAGE_NAMES[code]))
+        return True
     if cmd == "persona":
         if chat_id != OWNER_ID:
             send_plain(chat_id, t('persona_owner_only'))
             return True
         if arg.lower() == "reset":
-            _write_persona(
-                _persona_path(chat_id),
-                Path(__file__).with_name("personality.example.md").read_text(encoding="utf-8"),
-            )
+            _seed_default_persona(chat_id, chat_state(chat_id).get("language", "ru"))
             send_plain(chat_id, t('persona_reset_done'))
         elif arg:
             send_plain(chat_id, t('persona_usage'))
@@ -3903,6 +4038,7 @@ def _update_download_status(queue_state, runtime, force=False):
 def _process_local_message_queue(chat_id):
     """Process one chat's local-Bot-API updates in their arrival order."""
     while True:
+        _set_chat_language(chat_id)
         with process_lock:
             queue_state = local_message_queues.get(chat_id)
             if queue_state is None or not queue_state["messages"]:
@@ -3978,6 +4114,8 @@ def queue_local_message(runtime, message):
 
 def handle_message(message):
     chat_id = message.get("chat", {}).get("id")
+    if chat_id is not None:
+        _set_chat_language(chat_id)
     user_id = message.get("from", {}).get("id")
     if str(user_id) not in load_whitelist():
         if chat_id:
@@ -4036,7 +4174,11 @@ def handle_message(message):
                 except FileNotFoundError:
                     pass
                 else:
-                    agents_path.write_text(personality.replace("<user>", text), encoding="utf-8")
+                    was_default = _persona_is_default(chat_id)
+                    updated = personality.replace("<user>", text)
+                    _write_persona(agents_path, updated)
+                    if was_default:
+                        _mark_default_persona(chat_id, updated)
             update_state(runtime.state_key, account_status="ready")
             send_plain(chat_id, t('name_remembered'))
         else:
@@ -4067,6 +4209,8 @@ def main():
         runtime_state = state_db.get("runtime", {})
         completed_restart_chat_id = runtime_state.get("restart_completed_chat_id")
         completed_restart_message_id = runtime_state.get("restart_message_id")
+    if completed_restart_chat_id is not None:
+        _set_chat_language(completed_restart_chat_id)
     if completed_restart_chat_id:
         update_runtime_state(restart_completed_chat_id=None, restart_message_id=None)
         if completed_restart_message_id:

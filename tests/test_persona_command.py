@@ -1,11 +1,14 @@
 """Regression tests for the owner home migration and /persona command."""
 
 import importlib.util
+import hashlib
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -35,8 +38,10 @@ for _name, _value in _OLD_ENV.items():
 class PersonaCommandTests(unittest.TestCase):
     def setUp(self):
         bot.tenants.clear()
+        bot.update_state(bot.OWNER_ID, language="ru")
         bot.persona_message_ids.clear() if hasattr(bot, "persona_message_ids") else None
         self.home = Path(TEMP.name)
+        shutil.rmtree(self.home / "accounts" / str(bot.OWNER_ID), ignore_errors=True)
         self.source_home = self.home / ".codex"
         self.source_home.mkdir(exist_ok=True)
         (self.source_home / "AGENTS.md").write_text("OWNER AGENT MARKER\n", encoding="utf-8")
@@ -44,7 +49,7 @@ class PersonaCommandTests(unittest.TestCase):
             "[mcp_servers.owner_marker]\ncommand = \"marker\"\n", encoding="utf-8"
         )
         (self.source_home / "auth.json").write_text("auth", encoding="utf-8")
-        (self.source_home / "sessions" / "2026" / "09" / "25").mkdir(parents=True)
+        (self.source_home / "sessions" / "2026" / "09" / "25").mkdir(parents=True, exist_ok=True)
         (self.source_home / "sessions" / "2026" / "09" / "25" / "legacy.jsonl").write_text(
             "legacy rollout\n", encoding="utf-8"
         )
@@ -139,6 +144,89 @@ class PersonaCommandTests(unittest.TestCase):
                 persona.read_text(encoding="utf-8"),
                 (ROOT / "personality.example.md").read_text(encoding="utf-8"),
             )
+
+    def test_default_marker_lifecycle(self):
+        with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
+                patch.object(bot, "send_plain", return_value={"ok": True, "result": {"message_id": 77}}):
+            bot._seed_default_persona(bot.OWNER_ID, "ru")
+            self.assertTrue(bot._persona_is_default(bot.OWNER_ID))
+            self.assertTrue(bot.handle_command(bot.OWNER_ID, "/persona"))
+            self.assertTrue(bot.handle_persona_reply({
+                "chat": {"id": bot.OWNER_ID}, "text": "A custom persona with a distinct voice.",
+                "reply_to_message": {"message_id": 77},
+            }))
+            self.assertFalse(bot._persona_is_default(bot.OWNER_ID))
+            self.assertTrue(bot.handle_command(bot.OWNER_ID, "/persona reset"))
+            self.assertTrue(bot._persona_is_default(bot.OWNER_ID))
+
+    def test_new_tenant_gets_default_marker(self):
+        chat_id = bot.OWNER_ID + 123
+        with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp):
+            tenant = bot.tenant_codex_home(chat_id)
+            self.assertTrue((tenant / ".persona_default_sha256").is_file())
+            self.assertTrue(bot._persona_is_default(chat_id))
+
+    def test_language_switch_reseeds_default_persona(self):
+        with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
+                patch.object(bot, "send_plain") as send, \
+                patch.object(bot, "_translate_persona_file", side_effect=AssertionError("custom path used")):
+            bot._seed_default_persona(bot.OWNER_ID, "ru")
+            self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language EN"))
+            expected = (ROOT / "personality.example.en.md").read_text(encoding="utf-8")
+            path = bot._persona_path(bot.OWNER_ID)
+            self.assertEqual(path.read_text(encoding="utf-8"), expected)
+            self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text().strip(),
+                             hashlib.sha256(expected.encode()).hexdigest())
+            self.assertTrue(bot._persona_is_default(bot.OWNER_ID))
+            self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], "en")
+            self.assertIn("English", send.call_args.args[1])
+
+    def test_language_switch_translates_custom_persona_and_keeps_it_on_failure(self):
+        custom = "# Persona\nAlways answer in Russian. Speak plainly and keep this distinctive tone.\n"
+        translated = "# Persona\nAlways answer in German. Speak plainly and keep this distinctive tone.\n"
+        with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
+                patch.object(bot, "send_plain") as send:
+            bot._seed_default_persona(bot.OWNER_ID, "ru")
+            path = bot._persona_path(bot.OWNER_ID)
+            bot._write_persona(path, custom)
+            marker = bot._persona_marker_path(bot.OWNER_ID).read_text()
+            self.assertFalse(bot._persona_is_default(bot.OWNER_ID))
+
+            def translated_run(command, **kwargs):
+                self.assertIn("--ephemeral", command)
+                self.assertIn("read-only", command)
+                self.assertIn("--ignore-user-config", command)
+                self.assertEqual(kwargs["env"]["CODEX_HOME"], str(path.parent))
+                self.assertNotIn("TELEGRAM_BOT_TOKEN", kwargs["env"])
+                self.assertIn(custom, kwargs["input"])
+                Path(command[command.index("--output-last-message") + 1]).write_text(translated)
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            with patch.object(bot.subprocess, "run", side_effect=translated_run):
+                self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language de"))
+            self.assertEqual(path.read_text(encoding="utf-8"), translated)
+            self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text(), marker)
+            self.assertFalse(bot._persona_is_default(bot.OWNER_ID))
+            self.assertIn("German", send.call_args.args[1])
+
+            before = path.read_text(encoding="utf-8")
+            with patch.object(bot.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=1, stderr="translation failed", stdout="")):
+                self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language uk"))
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+            self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text(), marker)
+            self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], "uk")
+            self.assertIn("translation failed", send.call_args.args[1])
+
+    def test_invalid_language_preserves_state_and_persona(self):
+        with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
+                patch.object(bot, "send_plain") as send:
+            bot._seed_default_persona(bot.OWNER_ID, "ru")
+            before = bot._persona_path(bot.OWNER_ID).read_bytes()
+            self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language xx"))
+            self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], "ru")
+            self.assertEqual(bot._persona_path(bot.OWNER_ID).read_bytes(), before)
+            self.assertIn("/language", send.call_args.args[1])
 
 
 if __name__ == "__main__":

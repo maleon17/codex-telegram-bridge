@@ -1,5 +1,12 @@
 """Bot-authored UI strings, keyed for future per-chat localization."""
 
+import contextvars
+
+
+current_language: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_language", default="ru",
+)
+
 STRINGS: dict[str, dict[str, str]] = {
     "ru": {
         'access_denied': '⛔ Доступ к Codex-боту не разрешён. Попроси владельца добавить твой Telegram ID в whitelist.txt.',
@@ -34,6 +41,10 @@ STRINGS: dict[str, dict[str, str]] = {
         'context_fill_critical': '⚠️ Контекст заполнен на {percent}. Рекомендуется /compact или /new.',
         'context_fill_warning': '⚠️ Контекст заполнен на {percent}; скоро понадобится /compact.',
         'command_unknown': 'Неизвестная команда. Открой меню команд Telegram.',
+        'language_usage': 'Использование: /language en|ru|uk|kk|de.',
+        'language_command_description': 'Выбрать язык интерфейса и персоны',
+        'language_changed': 'Язык переключён: {language}.',
+        'language_persona_failed': 'Язык интерфейса переключён на {language}, но перевести персону не удалось: {error}',
         'context_window_exceeded': 'Контекст текущей сессии исчерпан. Используй /compact, чтобы сжать историю и продолжить, либо /new для новой сессии.',
         'compact_done': '🗜 Контекст сессии сжат. Можно продолжать.',
         'compact_failed': '🗜 Не удалось сжать контекст: {error}',
@@ -238,10 +249,15 @@ STRINGS: dict[str, dict[str, str]] = {
         'workspace_missing': 'Директория не существует: {path}',
         'workspace_usage': 'Workspace: {workspace}\nИспользование: /workspace <путь>|default',
     },
+    "en": {},
+    "uk": {},
+    "kk": {},
+    "de": {},
 }
 
 
-def t(key, lang="ru", **kwargs) -> str:
+def t(key, lang=None, **kwargs) -> str:
+    lang = lang or current_language.get()
     template = STRINGS.get(lang, {}).get(key)
     if template is None:
         template = STRINGS["ru"][key]
