@@ -37,7 +37,7 @@ LOCAL_GET_FILE_TIMEOUT_S = 600
 LOCAL_SEND_TIMEOUT_S = 600
 TELEGRAM_CLOUD_FILE_MAX_BYTES = 20 * 1024 * 1024
 IDLE_TIMEOUT_S = 300
-TOTAL_TIMEOUT_S = 1800
+COMPACT_TIMEOUT_S = 1800
 LOCAL_BOT_API_STATUS_EDIT_MIN_INTERVAL_S = 1.0
 COMMANDS = tuple(COMMAND_DESCRIPTIONS["ru"].items())
 
@@ -2544,14 +2544,15 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
             if process is None or process.poll() is not None:
                 error = t("codex_process_died")
                 break
-            if now - last_event > IDLE_TIMEOUT_S or now - started_at > TOTAL_TIMEOUT_S:
+            if now - last_event > IDLE_TIMEOUT_S:
                 error = t("codex_timed_out")
+                log(f"tenant={chat_id} turn idle timeout after {now - last_event:.0f}s without events")
                 stop_current_process(runtime)
                 break
         with process_lock:
             error = error or runtime.active_error
             stopped = runtime.active_stopped
-        view.deliver(stopped=stopped, error=error)
+        view.deliver(stopped=stopped and not error, error=error)
     except Exception as exc:
         log(f"Codex worker failed: {exc}")
         view.deliver(error=compact(str(exc), 1000))
@@ -2604,7 +2605,7 @@ def run_compaction(runtime, thread_id):
             runtime.active_stopped = False
             runtime.active_last_event_at = time.monotonic()
         client.request("thread/compact/start", {"threadId": server_thread_id}, timeout=60)
-        if not done.wait(TOTAL_TIMEOUT_S):
+        if not done.wait(COMPACT_TIMEOUT_S):
             error = t("compact_timeout")
         with process_lock:
             error = error or runtime.active_error

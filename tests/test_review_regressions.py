@@ -87,6 +87,62 @@ class StartupStopTests(unittest.TestCase):
         self.assertIn("turn/interrupt", calls)
 
 
+class TurnTimeoutTests(unittest.TestCase):
+    def _run_with_clock(self, refresh_events):
+        runtime = bot.TenantRuntime(1)
+        runtime.busy = True
+        bot.update_state(1, model="m", effort="low")
+        clock = [0.0]
+        calls = []
+
+        class Client:
+            process = type("Process", (), {"poll": lambda self: None})()
+
+            def start_if_needed(self):
+                pass
+
+            def request(self, method, params, timeout=None):
+                calls.append(method)
+                return {"turn": {"id": "turn"}} if method == "turn/start" else {}
+
+        class Done:
+            waits = 0
+
+            def wait(self, timeout):
+                self.waits += 1
+                clock[0] += 700 if refresh_events else bot.IDLE_TIMEOUT_S + 1
+                if refresh_events:
+                    runtime.active_last_event_at = clock[0]
+                return refresh_events and self.waits == 4
+
+            def set(self):
+                pass
+
+        client = Client()
+        runtime.app_server = client
+        with patch.object(bot, "get_app_server", return_value=client), \
+                patch.object(bot, "ensure_thread", return_value="thread"), \
+                patch.object(bot.threading, "Event", return_value=Done()), \
+                patch.object(bot.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(bot.TurnView, "flush"), \
+                patch.object(bot.TurnView, "deliver") as deliver:
+            bot.run_turn(runtime, [{"type": "text", "text": "x"}], None)
+        return calls, deliver
+
+    def test_active_turn_can_run_past_thirty_minutes(self):
+        calls, deliver = self._run_with_clock(refresh_events=True)
+        self.assertNotIn("turn/interrupt", calls)
+        self.assertEqual(deliver.call_args.kwargs, {"stopped": False, "error": None})
+
+    def test_idle_timeout_is_reported_as_error_not_manual_stop(self):
+        calls, deliver = self._run_with_clock(refresh_events=False)
+        self.assertIn("turn/interrupt", calls)
+        self.assertEqual(deliver.call_args.kwargs, {
+            "stopped": False,
+            "error": bot.t("codex_timed_out"),
+        })
+
+
 class MediaCommandTests(unittest.TestCase):
     def test_captioned_document_is_prompt_not_command(self):
         queued = []
