@@ -64,12 +64,17 @@ The installer asks for the bot token, owner ID, default workspace, sandbox and s
 
 ## Local Bot API server (optional)
 
-The [cloud Bot API](https://core.telegram.org/bots/faq#handling-media) lets bots download files up to 20 MB and upload files up to 50 MB. Optionally, `setup.sh` can
-build and configure one shared, loopback-only
-[`telegram-bot-api --local`](https://github.com/tdlib/telegram-bot-api) server;
-the [local API](https://core.telegram.org/bots/api#using-a-local-bot-api-server) removes the download size limit, allows uploads up to 2 GB and lets the bot use local file
-paths. It remains optional: leave the local-server question empty and the bot
-continues to use `https://api.telegram.org` as before.
+The [cloud Bot API](https://core.telegram.org/bots/faq#handling-media) lets bots
+download files up to 20 MB and upload files up to 50 MB. Optionally, `setup.sh`
+can build and configure one shared, loopback-only
+[`telegram-bot-api --local`](https://github.com/tdlib/telegram-bot-api) server.
+The [local API](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
+removes Telegram's download limit, allows uploads up to 2,000 MB and lets the
+bot use local file paths. The bridge itself defaults to 2,000 MiB limits for
+both incoming and outgoing files (`INCOMING_FILE_MAX_BYTES` and
+`FILE_SEND_MAX_BYTES`); Telegram's upload ceiling still applies. Files larger
+than 20 MB therefore work in local mode. Leave the local-server question empty
+and the bot continues to use `https://api.telegram.org` as before.
 
 The installer builds a pinned official source revision, stores `api_id` and
 `api_hash` only in a mode-`600` environment file, creates a systemd service and
