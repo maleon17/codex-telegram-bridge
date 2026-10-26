@@ -413,14 +413,14 @@ class RuntimeIsolationTests(unittest.TestCase):
 
 
 class ProcessEnvironmentTests(unittest.TestCase):
-    def test_app_server_env_keeps_codex_environment_but_blocks_bot_secrets(self):
+    def test_app_server_env_allows_only_runtime_keys(self):
         inherited = {
             "PATH": "/usr/bin",
             "HOME": "/tmp/codex-home",
             "LANG": "ru_RU.UTF-8",
             "LC_ALL": "ru_RU.UTF-8",
             "TERM": "xterm",
-            "CODEX_CLI_TEST": "keep-me",
+            "CODEX_CLI_TEST": "do-not-inherit",
             "TELEGRAM_BOT_TOKEN": "telegram-secret",
             "CODEX_BOT_STATE_FILE": "/tmp/state.json",
             "CODEX_BOT_PRIVATE": "bot-secret",
@@ -430,10 +430,11 @@ class ProcessEnvironmentTests(unittest.TestCase):
             child_env = bot.get_app_server(runtime).env
 
         for key, value in inherited.items():
-            if key.startswith("CODEX_BOT_") or key == "TELEGRAM_BOT_TOKEN":
+            if key not in bot.CHILD_ENV_KEYS:
                 self.assertNotIn(key, child_env)
             else:
                 self.assertEqual(child_env[key], value)
+        self.assertNotIn("CODEX_CLI_TEST", child_env)
 
 
 class FileSendTests(unittest.TestCase):

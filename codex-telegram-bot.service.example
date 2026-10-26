@@ -5,6 +5,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+UMask=0077
 Type=simple
 User=__USER__
 WorkingDirectory=__INSTALL_DIR__

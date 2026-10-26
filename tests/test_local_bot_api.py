@@ -104,6 +104,7 @@ class IncomingFileTests(unittest.TestCase):
     def test_attachment_failure_is_reported_to_the_agent_and_person(self):
         bot = load_bot()
         queued, replies = [], []
+        queued_event = threading.Event()
         message = {
             "chat": {"id": 1}, "from": {"id": 1}, "text": "Проверь файл",
             "document": {
@@ -111,9 +112,14 @@ class IncomingFileTests(unittest.TestCase):
                 "mime_type": "application/pdf", "file_size": 21 * 1024 * 1024,
             },
         }
-        with patch.object(bot, "queue_message", side_effect=lambda *args: queued.append(args)), \
+        def record_queue(*args):
+            queued.append(args)
+            queued_event.set()
+
+        with patch.object(bot, "queue_message", side_effect=record_queue), \
                 patch.object(bot, "send_plain", side_effect=lambda _chat, text: replies.append(text)):
             bot.handle_message(message)
+            self.assertTrue(queued_event.wait(2))
         self.assertEqual(len(queued), 1)
         prompt = "\n".join(item["text"] for item in queued[0][1] if item["type"] == "text")
         self.assertIn("[Файл не скачан:", prompt)

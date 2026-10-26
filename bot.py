@@ -139,7 +139,19 @@ TURN_STOP_WAIT_S = 10
 state_lock = threading.RLock()
 process_lock = threading.RLock()
 telegram_lock = threading.Lock()
-rate_limit_until = 0.0
+rate_limit_until = {}
+CHILD_ENV_KEYS = (
+    "PATH", "HOME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_COLLATE",
+    "LC_MESSAGES", "LC_NUMERIC", "LC_TIME", "TERM", "SHELL", "TMPDIR", "TZ",
+    "USER", "LOGNAME", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+
+
+def _child_base_env():
+    return {key: os.environ[key] for key in CHILD_ENV_KEYS if key in os.environ}
+
+
 restart_draining = False
 
 
@@ -211,10 +223,7 @@ def _translate_persona_file(chat_id, target_lang):
     )
     with tempfile.TemporaryDirectory(prefix="persona-translation-") as temporary:
         output_path = Path(temporary) / "result.md"
-        translation_env = {
-            key: value for key, value in os.environ.items()
-            if key != "TELEGRAM_BOT_TOKEN" and not key.startswith("CODEX_BOT_")
-        }
+        translation_env = _child_base_env()
         translation_env["CODEX_HOME"] = str(tenant_home)
         command = [
             "codex", "exec", "--ephemeral", "--ignore-user-config",
@@ -443,6 +452,7 @@ def tenant_codex_home(chat_id, state_key=None):
     if delegated:
         path = ACCOUNTS_DIR / "delegated" / str(chat_id)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.chmod(0o700)
         shared_home = tenant_codex_home(chat_id)
         # Only these two files are shared. Sessions and every other file stay
         # physically inside the delegated home above.
@@ -459,6 +469,7 @@ def tenant_codex_home(chat_id, state_key=None):
         return path
     path = ACCOUNTS_DIR / str(chat_id)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
     agents_path = path / "AGENTS.md"
     owner = chat_id == OWNER_ID
     seeded_default = False
@@ -511,6 +522,14 @@ def _rate_limited(result):
     return result.get("error_code") == 429
 
 
+def _rate_limit_deadline(key, now):
+    deadline = rate_limit_until.get(key, 0.0)
+    if deadline <= now:
+        rate_limit_until.pop(key, None)
+        return 0.0
+    return deadline
+
+
 def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
     """Call Telegram once; never retry, or call at all during a known 429 ban.
 
@@ -521,13 +540,14 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
     behind that poll for its entire duration, which is exactly what
     happened here (confirmed live via py-spy: run_turn's first live-progress
     edit sat blocked on this lock while the main loop held it inside
-    urlopen()). The lock only needs to protect the shared counter.
+    urlopen()). The lock only needs to protect the shared deadlines.
     """
-    global rate_limit_until
+    key = (params or {}).get("chat_id", "_global")
     with telegram_lock:
         now = time.monotonic()
-        if now < rate_limit_until and method != "getUpdates":
-            remaining = max(1, int(rate_limit_until - now + 0.999))
+        deadline = _rate_limit_deadline(key, now)
+        if now < deadline and method != "getUpdates":
+            remaining = max(1, int(deadline - now + 0.999))
             result = {
                 "ok": False,
                 "error_code": 429,
@@ -561,7 +581,8 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
             except (TypeError, ValueError):
                 delay = 1.0
             with telegram_lock:
-                rate_limit_until = max(rate_limit_until, time.monotonic() + delay)
+                now = time.monotonic()
+                rate_limit_until[key] = max(_rate_limit_deadline(key, now), now + delay)
             log(
                 f"Telegram {method} not ok: 429 Too Many Requests; "
                 f"bot rate-limited for {retry_after} seconds: {result}"
@@ -984,6 +1005,7 @@ def write_last_turn(chat_id, text, delegated=False, ok=None):
             signal["ok"] = bool(ok)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(signal, f)
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except OSError as exc:
         log(f"write_last_turn failed: {exc}")
@@ -1480,7 +1502,6 @@ def send_rich(chat_id, markdown_text):
 
 def send_document(chat_id, path, caption=""):
     """Upload one local document through the bridge-owned Telegram token."""
-    global rate_limit_until
     source = Path(path)
     size = source.stat().st_size
     if size > FILE_SEND_MAX_BYTES:
@@ -1516,8 +1537,9 @@ def send_document(chat_id, path, caption=""):
         log(f"Telegram local sendDocument rejected file://; retrying multipart: {local_result}")
     with telegram_lock:
         now = time.monotonic()
-        if now < rate_limit_until:
-            remaining = max(1, int(rate_limit_until - now + 0.999))
+        deadline = _rate_limit_deadline(chat_id, now)
+        if now < deadline:
+            remaining = max(1, int(deadline - now + 0.999))
             return {
                 "ok": False,
                 "error_code": 429,
@@ -1569,7 +1591,8 @@ def send_document(chat_id, path, caption=""):
             except (TypeError, ValueError):
                 delay = 1.0
             with telegram_lock:
-                rate_limit_until = max(rate_limit_until, time.monotonic() + delay)
+                now = time.monotonic()
+                rate_limit_until[chat_id] = max(_rate_limit_deadline(chat_id, now), now + delay)
         log(f"Telegram sendDocument not ok: {result}")
     return result
 
@@ -1765,36 +1788,41 @@ def process_file_send_queue():
         if not isinstance(request, dict):
             message = t("file_send_malformed_request")
         else:
-            chat_id = request.get("chat_id")
-            if isinstance(chat_id, int) and not isinstance(chat_id, bool):
-                _set_chat_language(chat_id)
-            else:
-                current_language.set("ru")
-            path = request.get("path")
-            caption = request.get("caption", "")
-            if not isinstance(chat_id, int) or isinstance(chat_id, bool):
-                message = t("file_send_bad_chat_id")
-            elif str(chat_id) not in load_whitelist():
-                message = t("file_send_not_whitelisted")
-            elif not isinstance(path, str) or not isinstance(caption, str):
-                message = t("file_send_bad_path_or_caption")
-            elif len(caption) > FILE_SEND_MAX_CAPTION_CHARS:
-                message = t("file_send_caption_too_long")
-            else:
-                source = _file_in_tenant_outbox(chat_id, path)
-                if source is None:
-                    message = t("file_send_outside_outbox")
-                elif source.stat().st_size > FILE_SEND_MAX_BYTES:
-                    message = t("file_send_too_big", limit=FILE_SEND_MAX_BYTES)
+            try:
+                chat_id = request.get("chat_id")
+                if isinstance(chat_id, int) and not isinstance(chat_id, bool):
+                    _set_chat_language(chat_id)
                 else:
-                    result = send_document(chat_id, source, caption)
-                    ok = bool(result.get("ok"))
-                    if ok:
-                        message = t("file_send_delivered", name=source.name)
+                    current_language.set("ru")
+                path = request.get("path")
+                caption = request.get("caption", "")
+                if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+                    message = t("file_send_bad_chat_id")
+                elif str(chat_id) not in load_whitelist():
+                    message = t("file_send_not_whitelisted")
+                elif not isinstance(path, str) or not isinstance(caption, str):
+                    message = t("file_send_bad_path_or_caption")
+                elif len(caption) > FILE_SEND_MAX_CAPTION_CHARS:
+                    message = t("file_send_caption_too_long")
+                else:
+                    source = _file_in_tenant_outbox(chat_id, path)
+                    if source is None:
+                        message = t("file_send_outside_outbox")
+                    elif source.stat().st_size > FILE_SEND_MAX_BYTES:
+                        message = t("file_send_too_big", limit=FILE_SEND_MAX_BYTES)
                     else:
-                        message = t("file_send_rejected", detail=compact(
-                            str(result.get("description") or result.get("error") or result), 500,
-                        ))
+                        result = send_document(chat_id, source, caption)
+                        ok = bool(result.get("ok"))
+                        if ok:
+                            message = t("file_send_delivered", name=source.name)
+                        else:
+                            message = t("file_send_rejected", detail=compact(
+                                str(result.get("description") or result.get("error") or result), 500,
+                            ))
+            except Exception as exc:
+                ok = False
+                message = t("file_send_rejected", detail=compact(str(exc), 500))
+                log(f"Could not process file-send request {request_id}: {exc}")
         try:
             _write_file_send_result(request_id, ok, message)
         except Exception as exc:
@@ -2126,12 +2154,7 @@ class TurnView:
 
 
 def codex_process_env(runtime, extra_env=None):
-    # Keep the system/Codex environment intact, but never inherit bot secrets
-    # or control-plane variables from the bridge process.
-    env = {
-        key: value for key, value in os.environ.items()
-        if key != "TELEGRAM_BOT_TOKEN" and not key.startswith("CODEX_BOT_")
-    }
+    env = _child_base_env()
     codex_home = tenant_codex_home(runtime.chat_id, state_key=runtime.state_key)
     if codex_home is not None:
         env["CODEX_HOME"] = str(codex_home)
@@ -2906,15 +2929,18 @@ def external_request_watcher():
         text = request.get("text")
         if not text:
             continue
-        start_delegate_turn(
-            chat_id,
-            text,
-            resume_thread_id=request.get("resume_thread_id"),
-            workspace=request.get("workspace"),
-            model=request.get("model"),
-            effort=request.get("effort"),
-            env=request.get("env"),
-        )
+        try:
+            start_delegate_turn(
+                chat_id,
+                text,
+                resume_thread_id=request.get("resume_thread_id"),
+                workspace=request.get("workspace"),
+                model=request.get("model"),
+                effort=request.get("effort"),
+                env=request.get("env"),
+            )
+        except Exception as exc:
+            log(f"external_request_watcher: start_delegate_turn failed for chat={chat_id}: {exc}")
 
 
 def _write_cross_delegate_result(request_id, ok, text):
@@ -3693,6 +3719,20 @@ def handle_update_flow_message(chat_id, text, runtime):
     return False
 
 
+def _finish_language_switch(chat_id, code, progress):
+    _set_chat_language(chat_id)
+    try:
+        if _persona_is_default(chat_id):
+            _seed_default_persona(chat_id, code)
+        else:
+            _translate_persona_file(chat_id, code)
+    except Exception as exc:
+        log(f"chat={chat_id} persona language switch failed: {exc}")
+        _finish_language_message(chat_id, progress, t('language_persona_failed', error=compact(str(exc), 500)))
+        return
+    _finish_language_message(chat_id, progress, t('language_changed'))
+
+
 def handle_command(chat_id, command, runtime=None):
     _set_chat_language(chat_id)
     runtime = runtime or get_tenant(chat_id)
@@ -3712,16 +3752,9 @@ def handle_command(chat_id, command, runtime=None):
         current_language.set(code)
         set_chat_commands(chat_id, code)
         progress = send_plain(chat_id, t('language_progress'))
-        try:
-            if _persona_is_default(chat_id):
-                _seed_default_persona(chat_id, code)
-            else:
-                _translate_persona_file(chat_id, code)
-        except Exception as exc:
-            log(f"chat={chat_id} persona language switch failed: {exc}")
-            _finish_language_message(chat_id, progress, t('language_persona_failed', error=compact(str(exc), 500)))
-            return True
-        _finish_language_message(chat_id, progress, t('language_changed'))
+        threading.Thread(
+            target=_finish_language_switch, args=(chat_id, code, progress), daemon=True,
+        ).start()
         return True
     if cmd == "persona":
         if chat_id != OWNER_ID:
@@ -4182,12 +4215,8 @@ def handle_message(message):
         else:
             threading.Thread(target=start_account_login, args=(runtime,), daemon=True).start()
         return
-    if LOCAL_BOT_API:
-        # A later text or another attachment must not overtake a getFile that
-        # is still downloading for this chat. Other chats have other workers.
-        queue_local_message(runtime, message)
-        return
-    process_message_inputs(runtime, message)
+    queue_local_message(runtime, message)
+    return
 
 
 def _command_payload(language):

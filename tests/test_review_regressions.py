@@ -146,25 +146,35 @@ class TurnTimeoutTests(unittest.TestCase):
 class MediaCommandTests(unittest.TestCase):
     def test_captioned_document_is_prompt_not_command(self):
         queued = []
+        queued_event = threading.Event()
         message = {"chat": {"id": 1}, "from": {"id": 1}, "caption": "/stop",
                    "document": {"file_id": "d", "file_name": "note.txt", "mime_type": "text/plain"}}
+        def record_queue(*args):
+            queued.append(args)
+            queued_event.set()
         with patch.object(bot, "load_whitelist", return_value={"1"}), \
                 patch.object(bot, "message_inputs", return_value=([{"type": "text", "text": "/stop"}], [], [])), \
-                patch.object(bot, "queue_message", side_effect=lambda *args: queued.append(args)), \
+                patch.object(bot, "queue_message", side_effect=record_queue), \
                 patch.object(bot, "handle_command") as command:
             bot.handle_message(message)
+            self.assertTrue(queued_event.wait(2))
         command.assert_not_called()
         self.assertEqual(len(queued), 1)
 
     def test_captioned_document_workspace_command_is_prompt_not_command(self):
         queued = []
+        queued_event = threading.Event()
         message = {"chat": {"id": 1}, "from": {"id": 1}, "caption": "/workspace /tmp",
                    "document": {"file_id": "d", "file_name": "note.txt", "mime_type": "text/plain"}}
+        def record_queue(*args):
+            queued.append(args)
+            queued_event.set()
         with patch.object(bot, "load_whitelist", return_value={"1"}), \
                 patch.object(bot, "message_inputs", return_value=([{"type": "text", "text": "/workspace /tmp"}], [], [])), \
-                patch.object(bot, "queue_message", side_effect=lambda *args: queued.append(args)), \
+                patch.object(bot, "queue_message", side_effect=record_queue), \
                 patch.object(bot, "handle_command") as command:
             bot.handle_message(message)
+            self.assertTrue(queued_event.wait(2))
         command.assert_not_called()
         self.assertEqual(len(queued), 1)
 

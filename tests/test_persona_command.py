@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -171,6 +172,7 @@ class PersonaCommandTests(unittest.TestCase):
 
     def test_language_switch_reseeds_default_persona(self):
         sent, edited = [], []
+        edited_event = threading.Event()
 
         def send(chat_id, text):
             message_id = 100 + len(sent)
@@ -179,6 +181,7 @@ class PersonaCommandTests(unittest.TestCase):
 
         def edit(chat_id, message_id, text):
             edited.append((chat_id, message_id, text))
+            edited_event.set()
             return {"ok": True}
 
         with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
@@ -187,8 +190,10 @@ class PersonaCommandTests(unittest.TestCase):
                 patch.object(bot, "_translate_persona_file", side_effect=AssertionError("custom path used")):
             bot._seed_default_persona(bot.OWNER_ID, "ru")
             for code in ("en", "de", "uk", "kk", "ru"):
+                edited_event.clear()
                 command_code = "EN" if code == "en" else code
                 self.assertTrue(bot.handle_command(bot.OWNER_ID, f"/language {command_code}"))
+                self.assertTrue(edited_event.wait(2))
                 name = "personality.example.md" if code == "ru" else f"personality.example.{code}.md"
                 expected = (ROOT / name).read_text(encoding="utf-8")
                 path = bot._persona_path(bot.OWNER_ID)
@@ -207,6 +212,7 @@ class PersonaCommandTests(unittest.TestCase):
         custom = "# Persona\nAlways answer in Russian. Speak plainly and keep this distinctive tone.\n"
         translated = "# Persona\nAlways answer in German. Speak plainly and keep this distinctive tone.\n"
         events = []
+        edited_event = threading.Event()
 
         def send(chat_id, text):
             message_id = 200 + len(events)
@@ -215,6 +221,7 @@ class PersonaCommandTests(unittest.TestCase):
 
         def edit(chat_id, message_id, text):
             events.append(("edit", chat_id, message_id, text))
+            edited_event.set()
             return {"ok": True}
 
         with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
@@ -235,12 +242,15 @@ class PersonaCommandTests(unittest.TestCase):
                 self.assertIn("--ignore-user-config", command)
                 self.assertEqual(kwargs["env"]["CODEX_HOME"], str(path.parent))
                 self.assertNotIn("TELEGRAM_BOT_TOKEN", kwargs["env"])
+                self.assertNotIn("CODEX_CLI_TEST", kwargs["env"])
                 self.assertIn(custom, kwargs["input"])
                 Path(command[command.index("--output-last-message") + 1]).write_text(translated)
                 return SimpleNamespace(returncode=0, stderr="", stdout="")
 
-            with patch.object(bot.subprocess, "run", side_effect=translated_run):
+            with patch.dict(os.environ, {"CODEX_CLI_TEST": "secret"}), \
+                    patch.object(bot.subprocess, "run", side_effect=translated_run):
                 self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language de"))
+                self.assertTrue(edited_event.wait(2))
             self.assertEqual(path.read_text(encoding="utf-8"), translated)
             self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text(), marker)
             self.assertFalse(bot._persona_is_default(bot.OWNER_ID))
@@ -255,8 +265,10 @@ class PersonaCommandTests(unittest.TestCase):
                 events.append(("translate",))
                 return SimpleNamespace(returncode=1, stderr="translation failed", stdout="")
 
+            edited_event.clear()
             with patch.object(bot.subprocess, "run", side_effect=failed_run):
                 self.assertTrue(bot.handle_command(bot.OWNER_ID, "/language uk"))
+                self.assertTrue(edited_event.wait(2))
             self.assertEqual(path.read_text(encoding="utf-8"), before)
             self.assertEqual(bot._persona_marker_path(bot.OWNER_ID).read_text(), marker)
             self.assertEqual(bot.chat_state(bot.OWNER_ID)["language"], "uk")
