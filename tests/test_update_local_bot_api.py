@@ -20,6 +20,7 @@ def load_bot(**environment):
         "TELEGRAM_BOT_TOKEN": "123456:test",
         "OWNER_ID": "1",
         "CODEX_BOT_STATE_FILE": str(Path(directory.name) / "state.json"),
+        "CODEX_BOT_RESTART_FILE": str(Path(directory.name) / "restart.request"),
         **environment,
     }
     with patch.dict(os.environ, values, clear=False):
