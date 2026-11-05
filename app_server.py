@@ -13,9 +13,11 @@ class AppServerError(RuntimeError):
 class AppServerClient:
     """Generation-safe JSONL client for a replaceable app-server process."""
 
-    def __init__(self, notification_handler, log, request_timeout=30, env=None):
+    def __init__(self, notification_handler, log, request_timeout=30, env=None,
+                 config_overrides=()):
         self.notification_handler, self.log = notification_handler, log
         self.request_timeout, self.env, self.process = request_timeout, env, None
+        self.config_overrides = tuple(config_overrides)
         self._write_lock, self._state_lock = threading.Lock(), threading.Lock()
         self._pending, self._next_id, self._closed_error = {}, 1, None
         self._generation, self._ready, self._init_error, self._readers = 0, None, None, {}
@@ -29,8 +31,11 @@ class AppServerClient:
                 self._closed_error = self._init_error = None
                 self._generation += 1
                 generation = self._generation
+                command = ["codex", "app-server", "--listen", "stdio://"]
+                for override in self.config_overrides:
+                    command.extend(("-c", override))
                 process = subprocess.Popen(
-                    ["codex", "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
+                    command, stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=self.env,
                 )
                 self.process, ready, self._ready = process, threading.Event(), None

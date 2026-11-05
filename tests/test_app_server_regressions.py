@@ -85,6 +85,20 @@ class _ClosingProcess(_Process):
 
 
 class InitFailureTests(unittest.TestCase):
+    def test_config_overrides_reach_app_server_process(self):
+        with patch("app_server.subprocess.Popen", return_value=_ClosingProcess()) as spawn:
+            client = AppServerClient(
+                lambda *args: None, lambda *args: None,
+                config_overrides=('mcp_servers.send-telegram-file.env.CHAT_ID="42"',),
+            )
+            client.start()
+            command = spawn.call_args.args[0]
+            client.close(timeout=0.1)
+        self.assertEqual(command, [
+            "codex", "app-server", "--listen", "stdio://",
+            "-c", 'mcp_servers.send-telegram-file.env.CHAT_ID="42"',
+        ])
+
     def test_failed_initialize_is_not_reused_by_next_request(self):
         created = []
         def spawn(*args, **kwargs):

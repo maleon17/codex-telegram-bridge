@@ -2177,6 +2177,10 @@ def get_app_server(runtime):
                 lambda method, params: handle_app_notification(runtime, method, params),
                 lambda message: log(f"tenant={runtime.chat_id} {message}"),
                 env=env,
+                config_overrides=(
+                    f'mcp_servers.send-telegram-file.env.CHAT_ID="{runtime.chat_id}"',
+                    f'mcp_servers.delegate-to-claude.env.CHAT_ID="{runtime.chat_id}"',
+                ),
             )
         return runtime.app_server
 
