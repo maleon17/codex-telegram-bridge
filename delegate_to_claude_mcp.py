@@ -9,9 +9,29 @@ import uuid
 from pathlib import Path
 
 
-CLAUDE_BRIDGE_DIR = Path(__file__).resolve().parent.parent / ".claude-telegram-bridge"
-QUEUE_DIR = CLAUDE_BRIDGE_DIR / "cross_delegate_queue"
-RESULT_DIR = CLAUDE_BRIDGE_DIR / "cross_delegate_result"
+# Directory names the peer bridge is cloned under: the GitHub repository name
+# first, then the historical local name.
+PEER_DIR_NAMES = ('claude-telegram-bridge', '.claude-telegram-bridge')
+PEER_MARKER_FILES = ('bridge.py', 'delegate_to_codex_mcp.py')
+
+
+def claude_bridge_dir():
+    """Locate the peer bridge checkout, or None when it is not installed.
+
+    $CLAUDE_TELEGRAM_BRIDGE_DIR names it explicitly; otherwise a sibling
+    directory of this checkout is used. A candidate counts only if it really is that bridge, so
+    a stray directory with the right name is never mistaken for it.
+    """
+    override = os.environ.get("CLAUDE_TELEGRAM_BRIDGE_DIR")
+    parent = Path(__file__).resolve().parent.parent
+    candidates = [Path(override).expanduser()] if override else []
+    candidates += [parent / name for name in PEER_DIR_NAMES]
+    for candidate in candidates:
+        if all((candidate / marker).is_file() for marker in PEER_MARKER_FILES):
+            return candidate
+    return None
+
+
 POLL_TIMEOUT_S = 20
 POLL_INTERVAL_S = 0.2
 
@@ -38,11 +58,14 @@ TOOL = {
 }
 
 
-def _write_request(request_id, chat_id, prompt):
-    QUEUE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    RESULT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    request_path = QUEUE_DIR / f"{request_id}.json"
-    temporary = QUEUE_DIR / f".{request_id}.{os.getpid()}.tmp"
+def _write_request(peer_dir, request_id, chat_id, prompt):
+    queue_dir = peer_dir / "cross_delegate_queue"
+    # Only the two queue leaves are created, inside a checkout already
+    # verified to be the peer bridge -- never the checkout itself.
+    queue_dir.mkdir(mode=0o700, exist_ok=True)
+    (peer_dir / "cross_delegate_result").mkdir(mode=0o700, exist_ok=True)
+    request_path = queue_dir / f"{request_id}.json"
+    temporary = queue_dir / f".{request_id}.{os.getpid()}.tmp"
     try:
         with temporary.open("x", encoding="utf-8") as handle:
             json.dump(
@@ -72,10 +95,17 @@ def _delegate_request(prompt):
     if not isinstance(prompt, str) or not prompt.strip():
         return False, "Отклонено локально: текст задачи пуст."
 
+    peer_dir = claude_bridge_dir()
+    if peer_dir is None:
+        return False, (
+            "Claude-бридж на этом сервере не установлен, делегировать некому. "
+            "Сообщи об этом пользователю и не повторяй попытку."
+        )
+
     request_id = str(uuid.uuid4())
-    result_path = RESULT_DIR / f"{request_id}.json"
+    result_path = peer_dir / "cross_delegate_result" / f"{request_id}.json"
     try:
-        request_path = _write_request(request_id, chat_id, prompt)
+        request_path = _write_request(peer_dir, request_id, chat_id, prompt)
     except OSError as exc:
         return False, f"Не удалось записать запрос в очередь Claude bridge: {exc}"
 
@@ -107,10 +137,14 @@ def _delegate_request(prompt):
     try:
         request_path.unlink()
     except FileNotFoundError:
-        pass
-    return (
-        False,
-        "Таймаут ожидания подтверждения от Claude bridge; запрос мог быть уже принят.",
+        # The peer claimed the request but its confirmation did not arrive.
+        return False, (
+            "Claude-бридж забрал запрос, но не подтвердил его за "
+            f"{POLL_TIMEOUT_S} с. Задача могла начаться; не отправляй её повторно."
+        )
+    return False, (
+        f"Claude-бридж не ответил за {POLL_TIMEOUT_S} с: похоже, его сервис не "
+        "запущен. Запрос отозван, задача НЕ начата."
     )
 
 

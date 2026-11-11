@@ -150,8 +150,12 @@ class PersonaCommandTests(unittest.TestCase):
             )
 
     def test_default_marker_lifecycle(self):
+        # The stock persona may be delivered inline or, when it is longer than
+        # one message, as a document; either way its message id is remembered.
+        snapshot = {"ok": True, "result": {"message_id": 77}}
         with patch.object(bot, "_ensure_tenant_mcp_config", side_effect=self._seed_mcp), \
-                patch.object(bot, "send_plain", return_value={"ok": True, "result": {"message_id": 77}}):
+                patch.object(bot, "send_document", return_value=snapshot), \
+                patch.object(bot, "send_plain", return_value=snapshot):
             bot._seed_default_persona(bot.OWNER_ID, "ru")
             self.assertTrue(bot._persona_is_default(bot.OWNER_ID))
             self.assertTrue(bot.handle_command(bot.OWNER_ID, "/persona"))

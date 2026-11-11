@@ -441,11 +441,23 @@ class FileSendTests(unittest.TestCase):
     def test_tenant_mcp_chat_id_overrides_project_config(self):
         runtime = bot.TenantRuntime(42)
         with patch.object(bot, "codex_process_env", return_value={}), \
+                patch.object(bot, "claude_bridge_dir", return_value=Path("/peer")), \
                 patch.object(bot, "AppServerClient") as client:
             bot.get_app_server(runtime)
         self.assertEqual(client.call_args.kwargs["config_overrides"], (
             'mcp_servers.send-telegram-file.env.CHAT_ID="42"',
             'mcp_servers.delegate-to-claude.env.CHAT_ID="42"',
+            'mcp_servers.delegate-to-claude.env.CLAUDE_TELEGRAM_BRIDGE_DIR="/peer"',
+        ))
+
+    def test_no_delegate_override_without_a_claude_bridge(self):
+        runtime = bot.TenantRuntime(43)
+        with patch.object(bot, "codex_process_env", return_value={}), \
+                patch.object(bot, "claude_bridge_dir", return_value=None), \
+                patch.object(bot, "AppServerClient") as client:
+            bot.get_app_server(runtime)
+        self.assertEqual(client.call_args.kwargs["config_overrides"], (
+            'mcp_servers.send-telegram-file.env.CHAT_ID="43"',
         ))
 
     def test_file_send_queue_only_accepts_tenant_outbox_and_reports_success(self):

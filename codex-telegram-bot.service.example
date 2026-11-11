@@ -10,7 +10,7 @@ Type=simple
 User=__USER__
 WorkingDirectory=__INSTALL_DIR__
 EnvironmentFile=__INSTALL_DIR__/.env
-Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=__HOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/bot.py
 Restart=always
 RestartSec=3

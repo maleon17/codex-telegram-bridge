@@ -6,6 +6,7 @@ cd "$SCRIPT_DIR"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found"; }
+as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
 ask_required() {
     local variable="$1" prompt="$2" secret="${3:-false}" value="${!1:-}"
     if [[ -z "$value" ]]; then
@@ -68,6 +69,7 @@ fi
 echo "== Codex Telegram Bot setup =="
 need python3
 need systemctl
+[[ $EUID -eq 0 ]] || need sudo
 
 CODEX_BIN="$(command -v codex || true)"
 if [[ -z "$CODEX_BIN" && -x "$HOME/.local/bin/codex" ]]; then
@@ -193,17 +195,20 @@ UNIT_FILE="$(mktemp "/tmp/${SERVICE_NAME}.service.XXXXXX")"
 trap 'rm -f "$UNIT_FILE"' EXIT
 sed \
     -e "s|__USER__|${INSTALL_USER}|g" \
+    -e "s|__HOME__|${HOME}|g" \
     -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
     codex-telegram-bot.service.example > "$UNIT_FILE"
 
 python3 -m py_compile bot.py app_server.py telegram_format.py
 echo "Installing /etc/systemd/system/${SERVICE_NAME}.service (sudo required)"
-sudo install -m 0644 "$UNIT_FILE" "/etc/systemd/system/${SERVICE_NAME}.service"
-sudo systemctl daemon-reload
-sudo systemctl enable --now "${SERVICE_NAME}.service"
+as_root install -m 0644 "$UNIT_FILE" "/etc/systemd/system/${SERVICE_NAME}.service"
+as_root systemctl daemon-reload
+as_root systemctl enable "${SERVICE_NAME}.service"
+# restart, not just start: a --reinstall must pick up the new .env.
+as_root systemctl restart "${SERVICE_NAME}.service"
 
 echo
-sudo systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+as_root systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 echo
 echo "Installed."
 echo "Logs:      journalctl -u ${SERVICE_NAME}.service -f"
@@ -215,7 +220,7 @@ if [ -t 0 ] && [ -f "$SCRIPT_DIR/personality.example.md" ]; then
     echo
     echo "The bridged assistant has no voice of its own beyond your AGENTS.md."
     echo "personality.example.md in this repo is a starting point you can install."
-    read -rp "Install it to  [1] ~/.codex/AGENTS.md  [2] $CODEX_CWD/AGENTS.md  [3] a path you choose  [4] skip : " P_CHOICE || P_CHOICE=3
+    read -rp "Install it to  [1] ~/.codex/AGENTS.md  [2] $CODEX_CWD/AGENTS.md  [3] a path you choose  [4] skip : " P_CHOICE || P_CHOICE=4
     case "${P_CHOICE:-4}" in
         1) P_DEST="$HOME/.codex/AGENTS.md" ;;
         2) P_DEST="${CODEX_CWD:-$HOME}/AGENTS.md" ;;

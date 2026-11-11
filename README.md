@@ -175,7 +175,7 @@ CODEX_BOT_ACCOUNTS_DIR=/absolute/path/accounts
 CODEX_BOT_RESTART_FILE=/absolute/path/restart.request
 ```
 
-Copy `codex-telegram-bot.service.example` to `/etc/systemd/system/codex-telegram-bot.service`, replace `__USER__` and `__INSTALL_DIR__`, then:
+Copy `codex-telegram-bot.service.example` to `/etc/systemd/system/codex-telegram-bot.service`, replace `__USER__`, `__HOME__` (that user's home directory) and `__INSTALL_DIR__`, then:
 
 ```bash
 sudo systemctl daemon-reload
@@ -199,6 +199,15 @@ journalctl -u codex-telegram-bot -f
 `danger-full-access` gives Codex the permissions of the service's Linux user. Whitelist only people you trust and prefer `workspace-write` when host-wide access is unnecessary.
 
 `NoNewPrivileges=true` prevents privilege escalation but does not isolate files already readable by the Unix user. Strong filesystem isolation requires separate Unix users or containers.
+
+## Working together with the Claude bridge
+
+This bot is complete on its own. If **[claude-telegram-bridge](https://github.com/maleon17/claude-telegram-bridge)** is installed on the same host, the two can hand tasks to each other:
+
+- **From a chat.** Every chat gets a `delegate_to_claude` tool. When someone asks Codex to "ask Claude" (or similar), the task is passed to the Claude bridge for that same Telegram user, and Claude's answer arrives in the Claude bot's chat. The user must be whitelisted and logged in on the Claude bridge too; nobody can delegate into someone else's account.
+- **From a shell or script.** `bridge_exec.py "<task>"` feeds a task to this running bot without going through Telegram and prints the final answer. It is owner-only and supports `--workspace`, `--resume`, `--model`, `--effort`, `--timeout` and `--env KEY=VALUE`.
+
+The peer is found automatically when it is cloned next to this repository (as `claude-telegram-bridge`). If it lives elsewhere, set `CLAUDE_TELEGRAM_BRIDGE_DIR=/path/to/it` in `.env` and restart. Without a Claude bridge on the host the `delegate_to_claude` tool is simply not offered.
 
 ## Product boundary
 

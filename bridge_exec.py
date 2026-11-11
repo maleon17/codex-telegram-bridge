@@ -39,7 +39,6 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_OWNER_ID = 8480261623
 
 
 def load_dotenv():
@@ -134,7 +133,14 @@ def main():
         sys.exit(1)
 
     env = load_dotenv()
-    real_owner_id = int(env.get("OWNER_ID") or os.environ.get("OWNER_ID") or DEFAULT_OWNER_ID)
+    try:
+        real_owner_id = int(env.get("OWNER_ID") or os.environ.get("OWNER_ID") or "")
+    except ValueError:
+        print(
+            "OWNER_ID не задан: укажи его в .env рядом со скриптом или в окружении.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     chat_id = args.chat_id or real_owner_id
 
     # bridge_exec.py is an owner-only tool -- but any tenant's Claude/Codex

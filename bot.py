@@ -21,7 +21,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: a stale MCP entry is simply left in place
+    tomllib = None
+
 from app_server import AppServerClient, AppServerError
+from delegate_to_claude_mcp import claude_bridge_dir
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
 from strings import COMMAND_DESCRIPTIONS, current_language, t
 from tenant_migration import apply_pending_tenant_migration
@@ -156,6 +162,91 @@ restart_draining = False
 
 
 DELEGATE_KEY_PREFIX = "delegate:"
+# One-time guidance appended to every non-owner persona: keep work out of the
+# shared home directory, and tidy up only what the agent itself created.
+WORKSPACE_RULES = {
+    "ru": """
+## Рабочая папка
+
+Не складывай файлы прямо в домашнюю директорию. Если твоя текущая рабочая
+папка — не домашняя директория, работай в ней. Иначе для каждой задачи или
+проекта используй отдельную папку: ту, что назвал пользователь, или уже
+существующую папку проекта; если такой нет — создай
+`~/projects/<короткое-имя>` и работай там.
+
+Если в домашней директории остались файлы, которые ты сам создал раньше (ты
+точно знаешь это из своей истории или памяти), при случае перенеси их в папку
+соответствующего проекта и сообщи пользователю, что и куда перенёс. Чужие
+файлы, репозитории, скрытые файлы (имя начинается с точки) и всё, в чём не
+уверен, не трогай — спроси пользователя.
+""".strip(),
+    "en": """
+## Working folder
+
+Do not drop files directly into the home directory. If your current working
+directory is not the home directory, work there. Otherwise use a separate
+folder for each task or project: the one the user named or an existing project
+folder; if there is none, create `~/projects/<short-name>` and work there.
+
+If the home directory still holds files you created earlier yourself (you know
+this for certain from your own history or memory), move them into the matching
+project folder when convenient and tell the user what went where. Do not touch
+other people's files, repositories, hidden files (names starting with a dot)
+or anything you are unsure about — ask the user.
+""".strip(),
+    "uk": """
+## Робоча папка
+
+Не складай файли прямо в домашню директорію. Якщо твоя поточна робоча папка —
+не домашня директорія, працюй у ній. Інакше для кожного завдання чи проєкту
+використовуй окрему папку: ту, яку назвав користувач, або вже наявну папку
+проєкту; якщо такої немає — створи `~/projects/<коротка-назва>` і працюй там.
+
+Якщо в домашній директорії залишилися файли, які ти сам створив раніше (ти
+точно знаєш це зі своєї історії чи пам'яті), за нагоди перенеси їх у папку
+відповідного проєкту й повідом користувачеві, що і куди перенесено. Чужі
+файли, репозиторії, приховані файли (назва починається з крапки) і все, у чому
+не впевнений, не чіпай — запитай користувача.
+""".strip(),
+    "kk": """
+## Жұмыс бумасы
+
+Файлдарды тікелей үй каталогына салма. Егер ағымдағы жұмыс бумаң үй каталогы
+болмаса, сонда жұмыс істе. Әйтпесе әр тапсырма немесе жоба үшін бөлек буманы
+қолдан: пайдаланушы атаған немесе бұрыннан бар жоба бумасын; ондай бума
+болмаса, `~/projects/<қысқа-атау>` бумасын жасап, сонда жұмыс істе.
+
+Егер үй каталогында бұрын өзің жасаған файлдар қалса (мұны өз тарихыңнан
+немесе жадыңнан нақты білесің), реті келгенде оларды тиісті жоба бумасына
+көшіріп, пайдаланушыға нені қайда көшіргеніңді айт. Бөтен файлдарға,
+репозиторийлерге, жасырын файлдарға (атауы нүктеден басталады) және сенімді
+емес нәрсенің бәріне тиіспе — пайдаланушыдан сұра.
+""".strip(),
+    "de": """
+## Arbeitsordner
+
+Lege Dateien nicht direkt im Home-Verzeichnis ab. Wenn dein aktuelles
+Arbeitsverzeichnis nicht das Home-Verzeichnis ist, arbeite dort. Andernfalls
+nutze für jede Aufgabe oder jedes Projekt einen eigenen Ordner: den vom Nutzer
+genannten oder einen bereits vorhandenen Projektordner; gibt es keinen, lege
+`~/projects/<kurzer-name>` an und arbeite dort.
+
+Liegen im Home-Verzeichnis noch Dateien, die du früher selbst erstellt hast
+(du weißt das sicher aus deinem eigenen Verlauf oder Gedächtnis), verschiebe
+sie bei Gelegenheit in den passenden Projektordner und sag dem Nutzer, was
+wohin verschoben wurde. Fremde Dateien, Repositories, versteckte Dateien (Name
+beginnt mit einem Punkt) und alles, bei dem du unsicher bist, rührst du nicht
+an — frag den Nutzer.
+""".strip(),
+}
+# The localized 'User' heading of the stock persona tells which language an
+# existing persona file is written in.
+WORKSPACE_RULES_LANGUAGE_HINTS = (
+    ("## User\n", "en"),
+    ("## Користувач\n", "uk"),
+    ("## Пайдаланушы\n", "kk"),
+    ("## Nutzer\n", "de"),
+)
 FILE_SEND_AGENTS_MARKER = "## Отправка файлов в Telegram"
 FILE_SEND_AGENTS_SECTION = """
 ## Отправка файлов в Telegram
@@ -400,10 +491,42 @@ def _ensure_tenant_mcp_server(tenant_dir, chat_id, name, server_filename):
         )
 
 
-def _ensure_tenant_mcp_config(tenant_dir, chat_id):
-    _ensure_tenant_mcp_server(
-        tenant_dir, chat_id, "delegate-to-claude", "delegate_to_claude_mcp.py",
+def _tenant_mcp_server_command(tenant_dir, name):
+    """The command line a tenant's config registers for one MCP server."""
+    if tomllib is None:
+        return None
+    try:
+        with (tenant_dir / "config.toml").open("rb") as handle:
+            server = tomllib.load(handle).get("mcp_servers", {}).get(name)
+    except (FileNotFoundError, tomllib.TOMLDecodeError, OSError):
+        return None
+    if not isinstance(server, dict):
+        return None
+    return [server.get("command"), *(server.get("args") or [])]
+
+
+def _withdraw_tenant_mcp_server(tenant_dir, name, server_filename):
+    """Remove a server this bot seeded earlier; leave a repointed one alone."""
+    server_path = Path(__file__).with_name(server_filename).resolve()
+    if _tenant_mcp_server_command(tenant_dir, name) != [sys.executable, str(server_path)]:
+        return
+    subprocess.run(
+        ["codex", "mcp", "remove", name],
+        env={**os.environ, "CODEX_HOME": str(tenant_dir)},
+        capture_output=True, text=True, timeout=30, check=False,
     )
+
+
+def _ensure_tenant_mcp_config(tenant_dir, chat_id):
+    if claude_bridge_dir() is None:
+        # No Claude bridge on this host: do not offer a tool that can only fail.
+        _withdraw_tenant_mcp_server(
+            tenant_dir, "delegate-to-claude", "delegate_to_claude_mcp.py",
+        )
+    else:
+        _ensure_tenant_mcp_server(
+            tenant_dir, chat_id, "delegate-to-claude", "delegate_to_claude_mcp.py",
+        )
     _ensure_tenant_mcp_server(
         tenant_dir, chat_id, "send-telegram-file", "send_telegram_file_mcp.py",
     )
@@ -428,6 +551,33 @@ def _ensure_tenant_file_send_instructions(agents_path):
         content.rstrip() + "\n\n" + FILE_SEND_AGENTS_SECTION + "\n",
         encoding="utf-8",
     )
+
+
+def _ensure_tenant_workspace_rules(chat_id, tenant_dir, agents_path):
+    """Append the working-folder guidance to an existing persona, exactly once.
+
+    New tenants get it from the stock persona; this reaches the ones created
+    before it existed. A flag file records that it was offered, so a tenant
+    who later removes the section does not get it back. A persona that was
+    still the unmodified default stays recognised as the default.
+    """
+    flag = tenant_dir / ".workspace_rules_seeded"
+    if flag.exists():
+        return
+    try:
+        content = agents_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, UnicodeError):
+        return
+    if not any(rules.splitlines()[0] in content for rules in WORKSPACE_RULES.values()):
+        language = next(
+            (lang for hint, lang in WORKSPACE_RULES_LANGUAGE_HINTS if hint in content), "ru",
+        )
+        was_default = _persona_is_default(chat_id)
+        updated = content.rstrip() + "\n\n" + WORKSPACE_RULES[language] + "\n"
+        _write_persona(agents_path, updated)
+        if was_default:
+            _mark_default_persona(chat_id, updated)
+    flag.touch(mode=0o600)
 
 
 def _migrate_owner_sessions(owner_dir):
@@ -507,6 +657,8 @@ def tenant_codex_home(chat_id, state_key=None):
     _ensure_tenant_file_send_instructions(agents_path)
     if seeded_default:
         _mark_default_persona(chat_id, agents_path.read_text(encoding="utf-8"))
+    if not owner:
+        _ensure_tenant_workspace_rules(chat_id, path, agents_path)
     try:
         _ensure_tenant_mcp_config(path, chat_id)
     except Exception as exc:
@@ -2173,14 +2325,27 @@ def get_app_server(runtime):
             runtime.pending_env = None
             env = codex_process_env(runtime, extra_env=extra_env)
             runtime.close_app_server_after_turn = bool(extra_env)
+            config_overrides = [
+                f'mcp_servers.send-telegram-file.env.CHAT_ID="{runtime.chat_id}"',
+            ]
+            peer_dir = claude_bridge_dir()
+            if peer_dir is not None:
+                # Only configure a server that is registered: an override for
+                # an absent one would define it without a command. Codex does
+                # not forward this process's environment to MCP servers, so
+                # the peer's location is passed the same way as the chat id.
+                config_overrides.append(
+                    f'mcp_servers.delegate-to-claude.env.CHAT_ID="{runtime.chat_id}"'
+                )
+                config_overrides.append(
+                    "mcp_servers.delegate-to-claude.env.CLAUDE_TELEGRAM_BRIDGE_DIR="
+                    + json.dumps(str(peer_dir))
+                )
             runtime.app_server = AppServerClient(
                 lambda method, params: handle_app_notification(runtime, method, params),
                 lambda message: log(f"tenant={runtime.chat_id} {message}"),
                 env=env,
-                config_overrides=(
-                    f'mcp_servers.send-telegram-file.env.CHAT_ID="{runtime.chat_id}"',
-                    f'mcp_servers.delegate-to-claude.env.CHAT_ID="{runtime.chat_id}"',
-                ),
+                config_overrides=tuple(config_overrides),
             )
         return runtime.app_server
 
