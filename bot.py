@@ -2117,6 +2117,11 @@ class TurnView:
         self.progress_msg_id = progress_msg_id
         self.progress_attempted = progress_msg_id is not None
         self.progress_lock = threading.Lock()
+        # Set once delivery starts. App Server events keep arriving on their
+        # own thread (a forced flush right after turn/completed, late usage
+        # updates), and a live edit landing after the final edit would turn
+        # the delivered answer back into the "🤔 ..." progress card.
+        self.finalized = False
 
     @staticmethod
     def _thought_id(item):
@@ -2206,6 +2211,8 @@ class TurnView:
     def _send_or_edit_live(self, text, force=False):
         """Publish one persistent process message and update it in place."""
         with self.progress_lock:
+            if self.finalized:
+                return
             now = time.monotonic()
             if (
                 self.progress_msg_id is not None
@@ -2268,6 +2275,10 @@ class TurnView:
             return bool(result and result.get("ok"))
 
     def deliver(self, stopped=False, error=None):
+        # Taking the lock waits out a live edit already on the wire; after
+        # this no live edit can touch the card again.
+        with self.progress_lock:
+            self.finalized = True
         final_index = next(
             (i for i in range(len(self.items) - 1, -1, -1)
              if self.items[i].get("type") == "agent_message"), None
