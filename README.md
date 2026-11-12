@@ -204,16 +204,25 @@ journalctl -u codex-telegram-bot -f
 
 This bot is complete on its own. If **[claude-telegram-bridge](https://github.com/maleon17/claude-telegram-bridge)** is installed on the same host, the two can hand tasks to each other:
 
-- **From a chat.** Every chat gets a `delegate_to_claude` tool. When someone asks Codex to "ask Claude" (or similar), the task is passed to the Claude bridge for that same Telegram user, and Claude's answer arrives in the Claude bot's chat. The user must be whitelisted and logged in on the Claude bridge too; nobody can delegate into someone else's account.
+- **From a chat.** Every chat gets a `delegate_to_claude` tool. When someone asks Codex to "ask Claude" (or similar), the task is passed to the Claude bridge for that same Telegram user. Codex waits for Claude's final answer (ten minutes by default) and continues with it; the same answer also arrives in the Claude bot's chat. The user must be whitelisted and logged in on the Claude bridge too; nobody can delegate into someone else's account.
 - **From a shell or script.** `bridge_exec.py "<task>"` feeds a task to this running bot without going through Telegram and prints the final answer. It is owner-only and supports `--workspace`, `--resume`, `--model`, `--effort`, `--timeout` and `--env KEY=VALUE`.
 
-The peer is found automatically when it is cloned next to this repository (as `claude-telegram-bridge`). If it lives elsewhere, set `CLAUDE_TELEGRAM_BRIDGE_DIR=/path/to/it` in `.env` and restart. Without a Claude bridge on the host the `delegate_to_claude` tool is simply not offered.
+The peer is found automatically: both bridges record themselves in the host's component registry at install time, and a checkout next to this repository (as `claude-telegram-bridge`) is recognised too. If it lives elsewhere, set `CLAUDE_TELEGRAM_BRIDGE_DIR=/path/to/it` in `.env` and restart. Without a Claude bridge on the host the `delegate_to_claude` tool is simply not offered.
+
+## Working together with ClaudeAsk / CodexAsk
+
+If **[CodexAsk](https://github.com/maleon17/codex-ask)** or **[ClaudeAsk](https://github.com/maleon17/claude-ask)** is installed on the same host, the two sides connect on their own:
+
+- **Telegram actions from the bot.** A person who is the registered owner of a userbot instance gets that instance's Telegram tools in their bot chat — send a message, read a chat's history, manage groups and triggers — executed in their own Telegram account through their userbot. Which instance belongs to whom is decided by the relay's owners map, not by the model: someone who owns no instance gets no tools, and nobody gets another person's. Because these calls do not come from a Telegram chat, every tool needs its target named explicitly.
+- **Tasks from Jarvis to the bot.** The userbot assistant can hand a task to this bot (`delegate_to_bridge`) and get the answer back. Only the instance's owner can trigger that, in their own request; trigger-fired runs and other people's requests are refused by the relay.
+
+A change in who owns which instance is picked up when the bot restarts.
 
 ## Product boundary
 
 This repository is the standalone Telegram Bot API frontend for Codex. The Telethon/userbot product is **[codex-ask](https://github.com/maleon17/codex-ask)** and deliberately has its own sessions/runtime.
 
-The two applications do not import one another or share command queues. This bot's filesystem channels are private runtime transport for its own MCP/file delivery path.
+The two applications do not import one another. They cooperate only through the documented channels above.
 
 See the **[Telegram AI hub](https://github.com/maleon17/telegram-ai)** for the complete ecosystem.
 

@@ -15,16 +15,34 @@ PEER_DIR_NAMES = ('claude-telegram-bridge', '.claude-telegram-bridge')
 PEER_MARKER_FILES = ('bridge.py', 'delegate_to_codex_mcp.py')
 
 
+def _registered_path(component):
+    """A component's checkout from the Telegram AI registry, if recorded
+    (~/.config/telegram-ai/registry.json; see telegram-ai-core's README)."""
+    base = os.environ.get("TELEGRAM_AI_CONFIG_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "telegram-ai",
+    )
+    try:
+        with open(os.path.join(base, "registry.json"), encoding="utf-8") as handle:
+            path = json.load(handle)["components"][component]["path"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return path if isinstance(path, str) else None
+
+
 def claude_bridge_dir():
     """Locate the peer bridge checkout, or None when it is not installed.
 
-    $CLAUDE_TELEGRAM_BRIDGE_DIR names it explicitly; otherwise a sibling
-    directory of this checkout is used. A candidate counts only if it really is that bridge, so
-    a stray directory with the right name is never mistaken for it.
+    $CLAUDE_TELEGRAM_BRIDGE_DIR names it explicitly; otherwise the component
+    registry (written by each product's setup.sh) and then a sibling directory
+    of this checkout are tried. A candidate counts only if it really is that
+    bridge, so a stray directory with the right name is never mistaken for it.
     """
     override = os.environ.get("CLAUDE_TELEGRAM_BRIDGE_DIR")
     parent = Path(__file__).resolve().parent.parent
     candidates = [Path(override).expanduser()] if override else []
+    registered = _registered_path("claude-bridge")
+    if registered:
+        candidates.append(Path(registered))
     candidates += [parent / name for name in PEER_DIR_NAMES]
     for candidate in candidates:
         if all((candidate / marker).is_file() for marker in PEER_MARKER_FILES):
@@ -34,15 +52,23 @@ def claude_bridge_dir():
 
 POLL_TIMEOUT_S = 20
 POLL_INTERVAL_S = 0.2
+# How long the tool waits for the delegated task's final answer by default,
+# and the most a caller may ask for.
+DEFAULT_WAIT_S = 600
+MAX_WAIT_S = 1800
+FINAL_POLL_INTERVAL_S = 1.0
 
 SERVER_INFO = {"name": "delegate-to-claude", "version": "1.0.0"}
 TOOL = {
     "name": "delegate_to_claude",
     "description": (
-        "Передать задачу Claude-тенанту текущего Telegram-пользователя. "
-        "Telegram chat_id берётся только из окружения этого MCP-процесса и "
-        "не может быть указан аргументом. Тул сразу сообщает, запущена ли "
-        "задача; итоговый ответ позже придёт в тот же чат от Claude bridge."
+        "Передать задачу Claude-тенанту текущего Telegram-пользователя и "
+        "получить его итоговый ответ. Telegram chat_id берётся только из "
+        "окружения этого MCP-процесса и не может быть указан аргументом. Тул "
+        "ждёт завершения задачи (по умолчанию до 10 минут) и возвращает ответ; "
+        "тот же ответ приходит пользователю в чат Claude-бота. Если задача "
+        "не успела завершиться за время ожидания, тул сообщает об этом — "
+        "ответ тогда придёт только в чат."
     ),
     "inputSchema": {
         "type": "object",
@@ -50,6 +76,15 @@ TOOL = {
             "prompt": {
                 "type": "string",
                 "description": "Полный текст задачи для Claude.",
+            },
+            "wait_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_WAIT_S,
+                "description": (
+                    "Сколько секунд ждать итоговый ответ (по умолчанию 600). "
+                    "0 — не ждать: только убедиться, что задача принята."
+                ),
             },
         },
         "required": ["prompt"],
@@ -86,7 +121,36 @@ def _write_request(peer_dir, request_id, chat_id, prompt):
     return request_path
 
 
-def _delegate_request(prompt):
+def _wait_for_final(final, wait_seconds):
+    """The delegated turn's final answer, or None if it is not there in time.
+
+    `final` comes from the peer's acceptance: the file it will write the
+    answer to and the earliest timestamp that counts (the file may still hold
+    an older turn's answer).
+    """
+    if not isinstance(final, dict) or not isinstance(final.get("path"), str):
+        return None
+    after_ts = float(final.get("after_ts") or 0)
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        try:
+            with open(final["path"], encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and float(data.get("ts") or 0) >= after_ts:
+            if final.get("consume"):
+                # A per-request result file: nobody else will collect it.
+                try:
+                    os.unlink(final["path"])
+                except OSError:
+                    pass
+            return data
+        time.sleep(FINAL_POLL_INTERVAL_S)
+    return None
+
+
+def _delegate_request(prompt, wait_seconds=DEFAULT_WAIT_S):
     raw_chat_id = os.environ.get("CHAT_ID", "")
     try:
         chat_id = int(raw_chat_id)
@@ -132,7 +196,21 @@ def _delegate_request(prompt):
         text = result.get("text")
         if not isinstance(text, str) or not text:
             text = "Claude bridge не указал причину ответа."
-        return bool(result.get("ok")), text
+        if not result.get("ok") or wait_seconds <= 0:
+            return bool(result.get("ok")), text
+        final = _wait_for_final(result.get("final"), wait_seconds)
+        if final is None:
+            return True, (
+                f"{text}\n\nЗадача принята, но за {int(wait_seconds)} с не завершилась "
+                "(или этот бридж не сообщает итог). Итоговый ответ придёт пользователю "
+                "в чат Claude-бота; сюда он уже не вернётся."
+            )
+        answer = final.get("text")
+        if not isinstance(answer, str) or not answer.strip():
+            answer = "(пустой ответ)"
+        if final.get("ok") is False:
+            return False, f"Claude завершил задачу с ошибкой:\n{answer}"
+        return True, f"Ответ Claude:\n{answer}"
 
     try:
         request_path.unlink()
@@ -193,13 +271,21 @@ def _handle_message(request):
         if params.get("name") != TOOL["name"]:
             return _jsonrpc_error(request_id, -32602, "Unknown tool")
         arguments = params.get("arguments") or {}
-        if not isinstance(arguments, dict) or set(arguments) != {"prompt"}:
+        if (
+            not isinstance(arguments, dict) or "prompt" not in arguments
+            or set(arguments) - {"prompt", "wait_seconds"}
+        ):
             return _jsonrpc_error(
                 request_id,
                 -32602,
-                "delegate_to_claude accepts exactly one argument: prompt",
+                "delegate_to_claude accepts: prompt (required), wait_seconds (optional)",
             )
-        ok, text = _delegate_request(arguments["prompt"])
+        wait_seconds = arguments.get("wait_seconds", DEFAULT_WAIT_S)
+        if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)):
+            return _jsonrpc_error(request_id, -32602, "wait_seconds must be a number")
+        ok, text = _delegate_request(
+            arguments["prompt"], max(0, min(float(wait_seconds), MAX_WAIT_S)),
+        )
         return _jsonrpc_result(
             request_id,
             {"content": [{"type": "text", "text": text}], "isError": not ok},

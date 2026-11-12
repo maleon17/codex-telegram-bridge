@@ -35,7 +35,7 @@ is_local_api_url() {
     [[ "${host,,}" != "api.telegram.org" ]]
 }
 
-check "python syntax" python3 -m py_compile bot.py app_server.py telegram_format.py
+check "python syntax" python3 -m py_compile bot.py app_server.py telegram_format.py telegram_actions_link.py delegate_to_claude_mcp.py
 check "codex CLI" codex --version
 check "owner Codex login" codex login status
 check ".env exists" test -f .env

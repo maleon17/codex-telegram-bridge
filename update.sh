@@ -15,7 +15,7 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 git fetch origin "$BRANCH"
 git merge --ff-only "origin/$BRANCH"
 
-python3 -m py_compile bot.py app_server.py telegram_format.py
+python3 -m py_compile bot.py app_server.py telegram_format.py telegram_actions_link.py delegate_to_claude_mcp.py
 
 COMMIT="$(git rev-parse --short HEAD)"
 echo "Updated to $COMMIT on $BRANCH."

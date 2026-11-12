@@ -28,6 +28,7 @@ except ModuleNotFoundError:  # Python 3.10: a stale MCP entry is simply left in 
 
 from app_server import AppServerClient, AppServerError
 from delegate_to_claude_mcp import claude_bridge_dir
+from telegram_actions_link import SERVER_NAME as TELEGRAM_ACTIONS_SERVER, resolve_binding
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
 from strings import COMMAND_DESCRIPTIONS, current_language, t
 from tenant_migration import apply_pending_tenant_migration
@@ -517,7 +518,75 @@ def _withdraw_tenant_mcp_server(tenant_dir, name, server_filename):
     )
 
 
+# Chats whose Telegram-action binding was already worked out by this process
+# (it involves the relay's CLI, too slow to repeat on every turn). A change
+# in who owns which instance is picked up on the next bot restart.
+_telegram_actions_checked = set()
+
+
+def _split_toml_tables(text, table):
+    """(text without `table` and its sub-tables, the removed part)."""
+    kept, removed, skipping = [], [], False
+    for line in text.splitlines(keepends=True):
+        header = line.strip()
+        if header.startswith("[") and header.endswith("]"):
+            name = header.strip("[]").strip()
+            skipping = name == table or name.startswith(table + ".")
+        (removed if skipping else kept).append(line)
+    return "".join(kept), "".join(removed)
+
+
+def _sync_telegram_actions_server(tenant_dir, chat_id):
+    """Give the owner of a userbot instance that instance's Telegram actions
+    (see telegram_actions_link.py); withdraw them when that stops being true.
+
+    The section is written directly instead of through `codex mcp add`: it
+    carries a token, which must not appear on a command line.
+    """
+    if chat_id in _telegram_actions_checked:
+        return
+    _telegram_actions_checked.add(chat_id)
+    table = f"mcp_servers.{TELEGRAM_ACTIONS_SERVER}"
+    config_path = tenant_dir / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    rest, existing = _split_toml_tables(text, table)
+    if existing and "JARVIS_RELAY_DIRECT" not in existing:
+        return  # a server of that name the tenant set up themselves
+    binding = resolve_binding(chat_id, str(tenant_dir), "codex-ask")
+    updated = rest
+    if binding:
+        lines = [
+            f"[{table}]",
+            f"command = {json.dumps(binding['command'])}",
+            f"args = {json.dumps(binding['args'])}",
+            "startup_timeout_sec = 20.0",
+            "tool_timeout_sec = 200.0",
+            "",
+            f"[{table}.env]",
+            *(f"{key} = {json.dumps(value)}" for key, value in binding["env"].items()),
+        ]
+        updated = (rest.rstrip("\n") + "\n\n" if rest.strip() else "") + "\n".join(lines) + "\n"
+    if updated == text:
+        return
+    fd, temporary = tempfile.mkstemp(prefix=".config.", dir=tenant_dir, text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(updated)
+        os.replace(temporary, config_path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _ensure_tenant_mcp_config(tenant_dir, chat_id):
+    _sync_telegram_actions_server(tenant_dir, int(chat_id))
     if claude_bridge_dir() is None:
         # No Claude bridge on this host: do not offer a tool that can only fail.
         _withdraw_tenant_mcp_server(
@@ -1138,6 +1207,15 @@ def update_runtime_state(**values):
         _save_state_locked()
 
 
+def last_turn_path(chat_id, delegated=False):
+    """The file a finished turn's final text is signalled through."""
+    filename = (
+        f"last_turn_{STATE_INSTANCE_NAME}_delegate_{chat_id}.json"
+        if delegated else f"last_turn_{chat_id}.json"
+    )
+    return STATE_FILE.with_name(filename)
+
+
 def write_last_turn(chat_id, text, delegated=False, ok=None):
     """Signal a completed turn's final text via a plain file instead of
     Telegram's getUpdates -- this process already owns that bot token's
@@ -1145,11 +1223,7 @@ def write_last_turn(chat_id, text, delegated=False, ok=None):
     update), so an external script polling the same API would just starve.
     Ordinary and delegated turns deliberately use different signal files;
     bridge_exec.py polls the delegated one."""
-    filename = (
-        f"last_turn_{STATE_INSTANCE_NAME}_delegate_{chat_id}.json"
-        if delegated else f"last_turn_{chat_id}.json"
-    )
-    path = STATE_FILE.with_name(filename)
+    path = last_turn_path(chat_id, delegated)
     tmp = path.with_suffix(".tmp")
     try:
         signal = {"text": text, "ts": time.time()}
@@ -2341,6 +2415,9 @@ def get_app_server(runtime):
                     "mcp_servers.delegate-to-claude.env.CLAUDE_TELEGRAM_BRIDGE_DIR="
                     + json.dumps(str(peer_dir))
                 )
+                # The tool waits for Claude's final answer, far longer than
+                # Codex's default per-tool timeout.
+                config_overrides.append("mcp_servers.delegate-to-claude.tool_timeout_sec=1900")
             runtime.app_server = AppServerClient(
                 lambda method, params: handle_app_notification(runtime, method, params),
                 lambda message: log(f"tenant={runtime.chat_id} {message}"),
@@ -3112,7 +3189,7 @@ def external_request_watcher():
             log(f"external_request_watcher: start_delegate_turn failed for chat={chat_id}: {exc}")
 
 
-def _write_cross_delegate_result(request_id, ok, text):
+def _write_cross_delegate_result(request_id, ok, text, final=None):
     CROSS_DELEGATE_RESULT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     result_path = CROSS_DELEGATE_RESULT_DIR / f"{request_id}.json"
     fd, temporary = tempfile.mkstemp(
@@ -3120,11 +3197,13 @@ def _write_cross_delegate_result(request_id, ok, text):
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(
-                {"done": True, "ok": bool(ok), "text": text},
-                handle,
-                ensure_ascii=False,
-            )
+            result = {"done": True, "ok": bool(ok), "text": text}
+            if final:
+                # Where the delegated turn's final answer will appear, so the
+                # delegating agent can wait for it instead of only learning
+                # that the task was accepted.
+                result["final"] = final
+            json.dump(result, handle, ensure_ascii=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -3159,6 +3238,7 @@ def cross_delegate_watcher():
                 pass
 
             ok = False
+            accepted_at = time.time()
             if not isinstance(request, dict):
                 result_text = t("cross_delegate_malformed_request")
             else:
@@ -3195,8 +3275,14 @@ def cross_delegate_watcher():
                                 if busy else
                                 t("cross_delegate_start_failed")
                             )
+            # A chat runs one delegated turn at a time, so its "last delegated
+            # turn" signal written after this moment is this request's answer.
+            final = (
+                {"path": str(last_turn_path(chat_id, delegated=True)), "after_ts": accepted_at}
+                if ok else None
+            )
             try:
-                _write_cross_delegate_result(request_id, ok, result_text)
+                _write_cross_delegate_result(request_id, ok, result_text, final)
             except Exception as exc:
                 log(f"Could not write cross-delegate result {request_id}: {exc}")
 

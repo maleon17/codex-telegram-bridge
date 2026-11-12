@@ -448,6 +448,7 @@ class FileSendTests(unittest.TestCase):
             'mcp_servers.send-telegram-file.env.CHAT_ID="42"',
             'mcp_servers.delegate-to-claude.env.CHAT_ID="42"',
             'mcp_servers.delegate-to-claude.env.CLAUDE_TELEGRAM_BRIDGE_DIR="/peer"',
+            'mcp_servers.delegate-to-claude.tool_timeout_sec=1900',
         ))
 
     def test_no_delegate_override_without_a_claude_bridge(self):

@@ -74,22 +74,84 @@ class PeerDiscoveryTests(unittest.TestCase):
                 self.assertEqual(delegate.claude_bridge_dir(), peer)
                 worker = threading.Thread(target=play_peer, args=(True,))
                 worker.start()
-                self.assertEqual(delegate._delegate_request("real task"), (True, "accepted"))
+                self.assertEqual(delegate._delegate_request("real task", 0), (True, "accepted"))
                 worker.join()
 
                 with patch.object(delegate, "POLL_TIMEOUT_S", 0.6):
-                    ok, text = delegate._delegate_request("nobody home")
+                    ok, text = delegate._delegate_request("nobody home", 0)
                     self.assertFalse(ok)
                     self.assertIn("НЕ начата", text)
                     self.assertEqual(list(queue.glob("*.json")), [])
 
                     worker = threading.Thread(target=play_peer, args=(False,))
                     worker.start()
-                    ok, text = delegate._delegate_request("claimed")
+                    ok, text = delegate._delegate_request("claimed", 0)
                     worker.join()
                     self.assertFalse(ok)
                     self.assertIn("забрал запрос", text)
                     self.assertNotIn("НЕ начата", text)
+
+
+class FinalAnswerTests(unittest.TestCase):
+    def _peer(self, directory, final_payload, stale=None):
+        peer = _make_peer(directory, "claude-telegram-bridge")
+        queue, results = peer / "cross_delegate_queue", peer / "cross_delegate_result"
+        final_path = peer / "final.json"
+
+        def run():
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                names = sorted(queue.glob("*.json")) if queue.is_dir() else []
+                if names:
+                    names[0].unlink()
+                    if stale is not None:
+                        final_path.write_text(json.dumps(stale), encoding="utf-8")
+                    (results / names[0].name).write_text(json.dumps({
+                        "done": True, "ok": True, "text": "accepted",
+                        "final": {"path": str(final_path), "after_ts": time.time(), "consume": True},
+                    }), encoding="utf-8")
+                    if final_payload is not None:
+                        time.sleep(0.3)
+                        temporary = final_path.with_suffix(".tmp")
+                        temporary.write_text(json.dumps(dict(final_payload, ts=time.time())), encoding="utf-8")
+                        temporary.replace(final_path)
+                    return
+                time.sleep(0.02)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        return peer, final_path, thread
+
+    def test_final_answer_comes_back_to_the_delegating_agent(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(delegate, "FINAL_POLL_INTERVAL_S", 0.05):
+            peer, final_path, thread = self._peer(directory, {"text": "42 is the answer", "ok": True})
+            with patch.dict(os.environ, {"CLAUDE_TELEGRAM_BRIDGE_DIR": str(peer), "CHAT_ID": "4242"}):
+                ok, text = delegate._delegate_request("compute", 5)
+            thread.join()
+            self.assertTrue(ok)
+            self.assertTrue(text.startswith("Ответ Claude") and text.endswith("42 is the answer"), text)
+            self.assertFalse(final_path.exists())
+
+    def test_failed_turn_and_stale_answer(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(delegate, "FINAL_POLL_INTERVAL_S", 0.05):
+            peer, _, thread = self._peer(directory, {"text": "boom", "ok": False})
+            with patch.dict(os.environ, {"CLAUDE_TELEGRAM_BRIDGE_DIR": str(peer), "CHAT_ID": "4242"}):
+                ok, text = delegate._delegate_request("compute", 5)
+            thread.join()
+            self.assertFalse(ok)
+            self.assertIn("boom", text)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(delegate, "FINAL_POLL_INTERVAL_S", 0.05):
+            stale = {"text": "OLD ANSWER", "ok": True, "ts": time.time() - 3600}
+            peer, _, thread = self._peer(directory, None, stale=stale)
+            with patch.dict(os.environ, {"CLAUDE_TELEGRAM_BRIDGE_DIR": str(peer), "CHAT_ID": "4242"}):
+                ok, text = delegate._delegate_request("slow", 0.4)
+            thread.join()
+            self.assertTrue(ok)
+            self.assertNotIn("OLD ANSWER", text)
+            self.assertIn("не завершилась", text)
 
 
 class TenantSeedingTests(unittest.TestCase):

@@ -199,7 +199,7 @@ sed \
     -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
     codex-telegram-bot.service.example > "$UNIT_FILE"
 
-python3 -m py_compile bot.py app_server.py telegram_format.py
+python3 -m py_compile bot.py app_server.py telegram_format.py telegram_actions_link.py delegate_to_claude_mcp.py
 echo "Installing /etc/systemd/system/${SERVICE_NAME}.service (sudo required)"
 as_root install -m 0644 "$UNIT_FILE" "/etc/systemd/system/${SERVICE_NAME}.service"
 as_root systemctl daemon-reload
@@ -209,6 +209,40 @@ as_root systemctl restart "${SERVICE_NAME}.service"
 
 echo
 as_root systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+# --- component registry -----------------------------------------------------
+# Lets the other Telegram AI parts on this host (the second bridge, ClaudeAsk,
+# CodexAsk) find this one without guessing directory names. Optional: nothing
+# here depends on it. Format: telegram-ai-core's README.
+register_component() {  # register_component NAME PATH UNIT
+    python3 - "$1" "$2" "$3" <<'REG' || echo "note: could not update the component registry (optional)"
+import fcntl, json, os, sys
+name, path, unit = sys.argv[1:4]
+base = os.environ.get("TELEGRAM_AI_CONFIG_DIR") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "telegram-ai")
+os.makedirs(base, mode=0o700, exist_ok=True)
+lock = os.open(os.path.join(base, ".registry.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(lock, fcntl.LOCK_EX)
+target = os.path.join(base, "registry.json")
+try:
+    with open(target, encoding="utf-8") as handle:
+        components = json.load(handle)["components"]
+    if not isinstance(components, dict):
+        components = {}
+except (OSError, ValueError, KeyError, TypeError):
+    components = {}
+entry = components.get(name) if isinstance(components.get(name), dict) else {}
+entry.update(path=path, unit=unit)
+components[name] = entry
+tmp = target + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump({"version": 1, "components": components}, handle, indent=2, sort_keys=True, ensure_ascii=False)
+    handle.write("\n")
+os.replace(tmp, target)
+REG
+}
+register_component codex-bridge "$INSTALL_DIR" "${SERVICE_NAME}.service"
+
 echo
 echo "Installed."
 echo "Logs:      journalctl -u ${SERVICE_NAME}.service -f"
