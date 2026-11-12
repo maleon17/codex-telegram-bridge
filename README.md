@@ -1,239 +1,181 @@
+<div align="center">
+
 # Codex Telegram Bridge
 
-> Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — persistent Claude Code and Codex workflows controlled from Telegram.
+**A persistent Codex session on your server, driven from a Telegram chat.**
 
-**A persistent Codex engineering session in your Telegram chat.**
+[Install](#install-in-three-steps) · [Commands](#commands) · [Several users](#letting-other-people-in) · [With other Telegram AI parts](#together-with-the-rest-of-telegram-ai) · [Troubleshooting](#troubleshooting)
 
-This project runs a real `codex app-server` on your Linux host and exposes it through a Telegram bot. Unlike wrappers that launch a fresh `codex exec` for every message, each Telegram user gets a persistent App Server process and resumable threads.
+Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude Code and Codex from Telegram, on your own subscription.
 
-It uses your existing ChatGPT/Codex subscription through the installed Codex CLI, not a metered OpenAI API key.
+</div>
 
-## Why App Server instead of one-shot prompts?
+---
+
+You write to a bot; Codex works on the machine where your projects live — with its shell, files and tools — and reports back in the chat. It runs on your ChatGPT/Codex subscription through the official Codex CLI, not on a metered API key.
 
 ```mermaid
 flowchart LR
-    T["Telegram"] <--> B["Codex Telegram Bridge"]
-    B <--> A["Persistent Codex App Server"]
-    A <--> H["Your host<br/>repos · shell · files · tools"]
+    T["You, in Telegram"] <--> B["Codex Telegram Bridge"]
+    B <--> A["Codex App Server<br/>(one per user, always on)"]
+    A <--> H["Your server<br/>repos · shell · files · tools"]
 ```
 
-The bridge keeps the engineering environment on the host where the repositories live. Telegram handles the human loop: give direction, watch progress, add context while a turn is active, interrupt it, resume an old thread, or receive the artifact when it is done.
+Unlike wrappers that start a fresh `codex exec` for every message, each user gets a long-lived Codex App Server, so conversations are real, resumable threads.
 
-## Highlights
+## What you get
 
-- **Persistent Codex threads** — `/new`, `/sessions`, `/resume`.
-- **Live work from the phone** — an editable progress card shows the active turn; completed turns arrive as normal Telegram messages with an optional collapsible process log.
-- **Mid-turn input** — messages sent while Codex is working can be added to the active turn.
-- **Clean interruption and compaction** — `/stop` maps to `turn/interrupt`; `/compact` starts native thread compaction.
-- **Runtime controls** — model, reasoning effort, sandbox and workspace are selectable per user.
-- **Detailed usage** — session tokens, context size, subscription limits and reset times.
-- **Files and images** — Telegram images become Codex `localImage` inputs; generated files return through a scoped MCP outbox.
-- **Multi-account isolation** — additional users receive their own `CODEX_HOME`, App Server process, credentials, sessions and usage.
-- **Safe restarts** — restarts are deferred until active answers finish.
-- **Message batching** — rapid messages and forwarded batches are combined rather than racing one another.
-- **Rich-message context** — forwarded text and Telegram rich messages keep their source and content context.
-- **Minimal runtime dependencies** — the bridge itself uses only Python's standard library.
+- **Real sessions** — `/new`, `/sessions`, `/resume`; threads survive restarts.
+- **Watch it work** — a live progress card while Codex works, then the answer as a normal message.
+- **Steer mid-turn** — a message sent while Codex is busy is added to the running turn, not queued.
+- **Stop and compact** — `/stop` interrupts the turn for real, `/compact` shrinks a long thread.
+- **Control from the phone** — model, reasoning effort, sandbox and working folder per user.
+- **Files both ways** — send photos and documents in; Codex sends results back as attachments.
+- **Your subscription, your limits** — `/usage` shows tokens, context and plan limits with reset times.
+- **Several users, fully isolated** — each with their own Codex account, threads and limits.
+- **Safe operations** — restarts wait for running answers; `/update` updates from Git.
+- **No extra dependencies** — the bot itself uses only Python's standard library.
 
-## Requirements
+## Install in three steps
 
-- Linux with Python 3.10+ and `systemd`
-- [Codex CLI](https://developers.openai.com/codex/cli/)
-- Owner authenticated with `codex login`
-- Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Numeric Telegram owner ID
+**You need:** a Linux server with `systemd` and Python 3.10+, the [Codex CLI](https://developers.openai.com/codex/cli/), and a bot token from [@BotFather](https://t.me/BotFather). Your numeric Telegram ID comes from [@userinfobot](https://t.me/userinfobot).
 
-## Quick install
+**1. Log in to Codex** as the Linux user that will run the bot:
+
+```bash
+codex login
+```
+
+**2. Install the bot:**
 
 ```bash
 git clone https://github.com/maleon17/codex-telegram-bridge.git
 cd codex-telegram-bridge
-
-codex login
-chmod +x setup.sh
 ./setup.sh
 ```
 
-Then verify:
+The installer checks your bot token with Telegram, then asks for your Telegram ID, a default working folder, the sandbox level and a service name. It installs and starts a systemd service; the token is stored in `.env` (mode `600`), never in the unit file.
+
+**3. Say hello.** Send any message to your bot. If something stays silent, run `./doctor.sh`.
+
+> **Sandbox levels:** `read-only` · `workspace-write` (can change files only in the working folder) · `danger-full-access` (everything the service's Linux user can do). Pick the narrowest that does the job — you can change it later per chat with `/mode`.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/new` | Start a new thread |
+| `/sessions` · `/resume <id>` | List recent threads · continue one (full ID or unique prefix) |
+| `/status` | Thread, account, model, sandbox, working folder, busy state |
+| `/stop` | Interrupt the running turn |
+| `/compact` | Compact the current thread's context |
+| `/usage` | Tokens, context size, subscription limits and reset times |
+| `/model [id]` · `/effort [level]` | Show or choose the model · reasoning effort |
+| `/mode read-only\|workspace-write\|full` | Choose the sandbox |
+| `/workspace <path>\|default` | Choose the working folder |
+| `/language en\|ru\|uk\|kk\|de` | Interface and persona language for this chat |
+| `/persona` · `/persona reset` | Show or reset this chat's persona |
+| `/account` · `/login` | Show · connect this chat's Codex account |
+| `/restart` · `/update` | Owner only: safe restart · update from Git and restart |
+
+## Letting other people in
+
+Put their numeric Telegram IDs into `whitelist.txt` (one per line or comma-separated) — no restart needed. On their first message the bot walks them through Codex's own device-code login; nobody ever pastes credentials into the chat.
+
+Every additional user gets a separate Codex account, App Server, threads, limits and settings under `accounts/<telegram_id>/`. Removing an ID blocks new messages; their data stays on disk until you delete it.
+
+> **Security:** in `danger-full-access` Codex can do whatever the service's Linux user can, and every whitelisted user shares that Linux user. Whitelist only people you trust, prefer `workspace-write`, and use separate Linux users or containers if you need hard isolation.
+
+## Together with the rest of Telegram AI
+
+The bot is complete on its own. When other parts of [Telegram AI](https://github.com/maleon17/telegram-ai) are installed **on the same server**, they find each other automatically (each `setup.sh` records itself in a small registry under `~/.config/telegram-ai/`):
+
+| Installed alongside | What it adds |
+|---|---|
+| **[Claude Telegram Bridge](https://github.com/maleon17/claude-telegram-bridge)** | Codex gets a `delegate_to_claude` tool: ask it to "check this with Claude", and it hands the task to Claude for the same Telegram user, waits for the answer and continues with it. That user needs an account on the Claude bot too. |
+| **[CodexAsk](https://github.com/maleon17/codex-ask)** / **[ClaudeAsk](https://github.com/maleon17/claude-ask)** | If you own a userbot instance, Codex in *your* chat can act in your Telegram account: send messages, read a chat's history, manage groups and triggers. Nobody gets another person's account. The userbot assistant can also hand tasks to this bot and get the answer back. |
+
+Changes in who owns which userbot are picked up on the next restart.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| The bot is silent | `./doctor.sh`, then `journalctl -u codex-telegram-bot -f`. Make sure no other process uses the same token. |
+| "Not logged in" for the owner | `codex login status` as the service's Linux user |
+| Another user cannot run Codex | `/account` in their chat, then `/login` again |
+| A bubblewrap warning in the log | Harmless: Codex falls back to its bundled copy. Installing the distro package silences it. |
+| "Limit reached" | `/usage` shows when the window resets |
+
+## Operations
 
 ```bash
-./doctor.sh
-journalctl -u codex-telegram-bot -f
+systemctl status codex-telegram-bot    # is it running?
+journalctl -u codex-telegram-bot -f    # live log
+./doctor.sh                            # health check
+./request-restart                      # restart once current answers are delivered
+./update.sh                            # update from Git (then ./request-restart)
 ```
 
-The installer asks for the bot token, owner ID, default workspace, sandbox and service name. It stores the token in a mode-`600` `.env`, outside the systemd unit.
+`/update` does the same from Telegram and restarts by itself.
 
-## Local Bot API server (optional)
+<details>
+<summary><b>Large files: optional local Bot API server</b></summary>
 
-The [cloud Bot API](https://core.telegram.org/bots/faq#handling-media) lets bots
-download files up to 20 MB and upload files up to 50 MB. Optionally, `setup.sh`
-can build and configure one shared, loopback-only
-[`telegram-bot-api --local`](https://github.com/tdlib/telegram-bot-api) server.
-The [local API](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
-removes Telegram's download limit, allows uploads up to 2,000 MB and lets the
-bot use local file paths. The bridge itself defaults to 2,000 MiB limits for
-both incoming and outgoing files (`INCOMING_FILE_MAX_BYTES` and
-`FILE_SEND_MAX_BYTES`); Telegram's upload ceiling still applies. Files larger
-than 20 MB therefore work in local mode. Leave the local-server question empty
-and the bot continues to use `https://api.telegram.org` as before.
+Telegram's cloud Bot API limits bots to 20 MB downloads and 50 MB uploads. `setup.sh` can optionally build Telegram's official [`telegram-bot-api --local`](https://github.com/tdlib/telegram-bot-api) server (loopback only, shared by all bots on the machine), which lifts the download limit and allows uploads up to 2,000 MB. Leave the question empty to keep using the cloud API.
 
-The installer builds a pinned official source revision, stores `api_id` and
-`api_hash` only in a mode-`600` environment file, creates a systemd service and
-a daily cleanup timer. It never asks for those credentials when a healthy shared
-server already exists. Run its plan without changing the machine with:
+The installer builds a pinned official revision, keeps `api_id`/`api_hash` (from [my.telegram.org](https://my.telegram.org)) only in a mode-`600` file, and adds a daily cleanup timer. Preview it without changing anything:
 
 ```bash
 scripts/install-local-bot-api.sh --dry-run
 ```
 
-The shared-server settings may be overridden before invoking the installer:
-`TELEGRAM_BOT_API_UNIT` (default `telegram-bot-api`),
-`TELEGRAM_BOT_API_PORT` (default `8081`), `TELEGRAM_BOT_API_DIR` (default
-`$HOME/.local/share/telegram-bot-api`), `TELEGRAM_BOT_API_ENV_FILE` (default
-`$HOME/.config/telegram-bot-api/env`), `TELEGRAM_BOT_API_BIN`,
-`TELEGRAM_BOT_API_REF`, and `TELEGRAM_BOT_API_RETENTION_DAYS` (default `7`).
-The data directory is retained, while the cleanup timer removes files older
-than the configured number of days.
+Overridable before running: `TELEGRAM_BOT_API_UNIT` (default `telegram-bot-api`), `TELEGRAM_BOT_API_PORT` (`8081`), `TELEGRAM_BOT_API_DIR`, `TELEGRAM_BOT_API_ENV_FILE`, `TELEGRAM_BOT_API_BIN`, `TELEGRAM_BOT_API_REF`, `TELEGRAM_BOT_API_RETENTION_DAYS` (`7`).
 
-After the installer is ready, setup verifies the bot against the cloud API,
-asks for explicit confirmation, calls cloud `logOut`, then verifies the bot
-through the local URL and writes `TELEGRAM_API_URL=http://127.0.0.1:<port>` to
-the bot's `.env`. `logOut` is one-way for roughly 10 minutes: do not switch
-back to the cloud API during that interval. The local server is deliberately
-shared by projects on the same machine; each bot still has its own token.
+Switching logs the bot out of the cloud API (Telegram's `logOut`), which cannot be undone for about 10 minutes. To go back: log the bot out through the local API, stop it, wait ~10 minutes, remove `TELEGRAM_API_URL` from `.env`, start it again. Never put the bot token on a command line.
 
-To return to the cloud API, first log the bot out through its local API using a
-credential-safe client, stop the bot, wait about 10 minutes, remove
-`TELEGRAM_API_URL` from the bot's protected `.env`, and start the bot again.
-Do not place a bot token in a shell command, service unit, or repository file.
+</details>
 
-## Commands
+<details>
+<summary><b>Delegating from scripts (<code>bridge_exec.py</code>)</b></summary>
 
-| Command | Description |
-|---|---|
-| `/language en\|ru\|uk\|kk\|de` | Set this chat's interface and persona language; update the Telegram command menu |
-| `/persona` / `/persona reset` | Owner-only: show or reset the chat persona |
-| `/new` | Start a new Codex thread |
-| `/sessions` | List recent threads |
-| `/resume <id>` | Resume by full ID or unique prefix |
-| `/status` | Show thread, account, model, sandbox, workspace and busy state |
-| `/stop` | Interrupt the active turn |
-| `/compact` | Compact current thread context |
-| `/usage` | Show session/context/subscription usage |
-| `/model [id]` | Show/select model |
-| `/effort [level]` | Show/select reasoning effort |
-| `/mode read-only\|workspace-write\|full` | Select sandbox policy |
-| `/workspace <path>\|default` | Select working directory |
-| `/account` | Show current isolated Codex account |
-| `/login` | Authenticate an additional user |
-| `/restart` | Owner-only safe deferred restart |
-| `/update` | Owner-only update + deferred restart |
+`bridge_exec.py "<task>"` gives a task to the running bot without going through Telegram and prints the final answer — handy for other agents or cron jobs on the same server. Owner only. Options: `--workspace`, `--resume <thread>`, `--model`, `--effort`, `--timeout`, `--env KEY=VALUE` (a secret for this one turn only). The answer also appears in your chat, with a note on how to return to your own thread.
 
-## Multi-account model
+</details>
 
-The owner keeps the normal `~/.codex`. Add other users' numeric Telegram IDs to `whitelist.txt` (comma or newline separated); it is re-read on every update without a restart. On first contact, each additional user authenticates with the official device-code flow and receives isolated state under `accounts/<telegram_id>/`.
+<details>
+<summary><b>Manual install, files and settings</b></summary>
 
-Each additional user gets independent credentials, subscription limits, App Server process, sessions, model/sandbox/workspace state, and active-turn state.
-
-The bridge never asks users to paste Codex credentials into Telegram.
-
-Removing an ID from `whitelist.txt` blocks new messages. Existing credentials remain on disk until you deliberately remove that user's account directory.
-
-## File delivery
-
-Generated files are returned through a tenant-scoped Telegram MCP tool. The agent places an artifact in `CODEX_TELEGRAM_OUTBOX` and calls `send_telegram_file`; only regular files from that user's outbox are accepted.
-
-This keeps the bot token outside the agent process and prevents arbitrary filesystem paths from becoming Telegram attachments.
-
-## Runtime data
-
-These paths are intentionally ignored by Git:
-
-| Path | Purpose |
-|---|---|
-| `.env` | Bot token and deployment configuration |
-| `state.json` | Thread IDs, preferences and usage snapshots |
-| `whitelist.txt` | Allowed Telegram users |
-| `accounts/` | Isolated additional-user `CODEX_HOME` data |
-| `restart.request` | Short-lived deferred-restart signal |
-
-Treat `.env` and `accounts/` as secrets.
-
-Stop the service before copying these paths for backup.
-
-## Manual install
-
-Run `codex login` as the Linux user that will run the service. Create `.env` with mode `600`:
+Run `codex login` as the Linux user that will run the service, then create `.env` with mode `600`:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=123456:replace_me
 OWNER_ID=123456789
 CODEX_CWD=/home/your-user
-CODEX_SANDBOX=danger-full-access
+CODEX_SANDBOX=workspace-write
 CODEX_BOT_STATE_FILE=/absolute/path/state.json
 CODEX_BOT_WHITELIST_FILE=/absolute/path/whitelist.txt
 CODEX_BOT_ACCOUNTS_DIR=/absolute/path/accounts
 CODEX_BOT_RESTART_FILE=/absolute/path/restart.request
 ```
 
-Copy `codex-telegram-bot.service.example` to `/etc/systemd/system/codex-telegram-bot.service`, replace `__USER__`, `__HOME__` (that user's home directory) and `__INSTALL_DIR__`, then:
+Copy `codex-telegram-bot.service.example` to `/etc/systemd/system/codex-telegram-bot.service`, replace `__USER__`, `__HOME__` and `__INSTALL_DIR__`, then `sudo systemctl daemon-reload && sudo systemctl enable --now codex-telegram-bot`.
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now codex-telegram-bot.service
-```
+Runtime files (all git-ignored; treat `.env` and `accounts/` as secrets, stop the service before backing them up):
 
-## Operations
+| Path | Purpose |
+|---|---|
+| `.env` | Bot token and settings |
+| `state.json` | Thread IDs, preferences, usage |
+| `whitelist.txt` | Allowed Telegram users |
+| `accounts/` | Per-user Codex homes |
 
-```bash
-systemctl status codex-telegram-bot
-journalctl -u codex-telegram-bot -f
-./doctor.sh
-./request-restart
-./update.sh
-```
+Optional `.env` keys: `TELEGRAM_API_URL` (local Bot API), `CLAUDE_TELEGRAM_BRIDGE_DIR` (if the Claude bridge is not found automatically), `INCOMING_FILE_MAX_BYTES`, `FILE_SEND_MAX_BYTES`.
 
-`/update` provides the Telegram-side update path. `git pull --ff-only` followed by `./request-restart` remains the shell fallback. The restart watcher edits its status message to “ready” after the new process starts.
+Tests: `TELEGRAM_BOT_TOKEN=000000:test OWNER_ID=1 python3 -m unittest discover -s tests`.
 
-## Security
-
-`danger-full-access` gives Codex the permissions of the service's Linux user. Whitelist only people you trust and prefer `workspace-write` when host-wide access is unnecessary.
-
-`NoNewPrivileges=true` prevents privilege escalation but does not isolate files already readable by the Unix user. Strong filesystem isolation requires separate Unix users or containers.
-
-## Working together with the Claude bridge
-
-This bot is complete on its own. If **[claude-telegram-bridge](https://github.com/maleon17/claude-telegram-bridge)** is installed on the same host, the two can hand tasks to each other:
-
-- **From a chat.** Every chat gets a `delegate_to_claude` tool. When someone asks Codex to "ask Claude" (or similar), the task is passed to the Claude bridge for that same Telegram user. Codex waits for Claude's final answer (ten minutes by default) and continues with it; the same answer also arrives in the Claude bot's chat. The user must be whitelisted and logged in on the Claude bridge too; nobody can delegate into someone else's account.
-- **From a shell or script.** `bridge_exec.py "<task>"` feeds a task to this running bot without going through Telegram and prints the final answer. It is owner-only and supports `--workspace`, `--resume`, `--model`, `--effort`, `--timeout` and `--env KEY=VALUE`.
-
-The peer is found automatically: both bridges record themselves in the host's component registry at install time, and a checkout next to this repository (as `claude-telegram-bridge`) is recognised too. If it lives elsewhere, set `CLAUDE_TELEGRAM_BRIDGE_DIR=/path/to/it` in `.env` and restart. Without a Claude bridge on the host the `delegate_to_claude` tool is simply not offered.
-
-## Working together with ClaudeAsk / CodexAsk
-
-If **[CodexAsk](https://github.com/maleon17/codex-ask)** or **[ClaudeAsk](https://github.com/maleon17/claude-ask)** is installed on the same host, the two sides connect on their own:
-
-- **Telegram actions from the bot.** A person who is the registered owner of a userbot instance gets that instance's Telegram tools in their bot chat — send a message, read a chat's history, manage groups and triggers — executed in their own Telegram account through their userbot. Which instance belongs to whom is decided by the relay's owners map, not by the model: someone who owns no instance gets no tools, and nobody gets another person's. Because these calls do not come from a Telegram chat, every tool needs its target named explicitly.
-- **Tasks from Jarvis to the bot.** The userbot assistant can hand a task to this bot (`delegate_to_bridge`) and get the answer back. Only the instance's owner can trigger that, in their own request; trigger-fired runs and other people's requests are refused by the relay.
-
-A change in who owns which instance is picked up when the bot restarts.
-
-## Product boundary
-
-This repository is the standalone Telegram Bot API frontend for Codex. The Telethon/userbot product is **[codex-ask](https://github.com/maleon17/codex-ask)** and deliberately has its own sessions/runtime.
-
-The two applications do not import one another. They cooperate only through the documented channels above.
-
-See the **[Telegram AI hub](https://github.com/maleon17/telegram-ai)** for the complete ecosystem.
-
-## Troubleshooting
-
-- **Bot is silent:** run `./doctor.sh`, inspect the journal, verify the BotFather token and ensure no second process polls it.
-- **Owner is unauthorized:** run `codex login status` as the service user.
-- **Additional user cannot run Codex:** check `/account`, retry `/login`, and verify their account directory is writable.
-- **Sandbox/bubblewrap warning:** Codex can use its bundled bubblewrap; installing the distro package removes the warning.
-- **Rate limit reached:** `/usage` shows the active limit window and reset time.
+</details>
 
 ## License
 
-MIT, see [LICENSE](LICENSE). `telegram_format.py` is adapted from [hermes-agent](https://github.com/NousResearch/hermes-agent) under the MIT License.
+MIT, see [LICENSE](LICENSE). `telegram_format.py` is adapted from [hermes-agent](https://github.com/NousResearch/hermes-agent) (MIT).
