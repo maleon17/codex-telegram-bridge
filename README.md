@@ -14,12 +14,10 @@ Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude Co
 
 You write to a bot; Codex works on the machine where your projects live — with its shell, files and tools — and reports back in the chat. It runs on your ChatGPT/Codex subscription through the official Codex CLI, not on a metered API key.
 
-```mermaid
-flowchart LR
-    T["You, in Telegram"] <--> B["Codex Telegram Bridge"]
-    B <--> A["Codex App Server<br/>(one per user, always on)"]
-    A <--> H["Your server<br/>repos · shell · files · tools"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img alt="You and the people you let in chat with the bot; the Codex Telegram Bridge on your server keeps one Codex App Server per user, each with its own login, working in your repos, shell and files, and steers running turns mid-flight; optionally it delegates to the Claude bridge and acts in your Telegram account through your userbot." src="docs/architecture-light.svg" width="860">
+</picture>
 
 Unlike wrappers that start a fresh `codex exec` for every message, each user gets a long-lived Codex App Server, so conversations are real, resumable threads.
 
