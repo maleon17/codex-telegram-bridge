@@ -93,7 +93,7 @@ try:
 except ValueError as exc:
     raise SystemExit("codex-telegram-bot: OWNER_ID must be an integer") from exc
 
-CODEX_CWD = os.environ.get("CODEX_CWD", "/home/mishin")
+CODEX_CWD = os.environ.get("CODEX_CWD") or os.path.expanduser("~")
 CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "danger-full-access")
 STATE_FILE = Path(
     os.environ.get("CODEX_BOT_STATE_FILE", Path(__file__).with_name("state.json"))
