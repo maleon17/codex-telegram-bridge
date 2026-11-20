@@ -47,8 +47,8 @@ codex login
 **2. Install the bot:**
 
 ```bash
-git clone https://github.com/maleon17/codex-telegram-bridge.git
-cd codex-telegram-bridge
+git clone https://github.com/maleon17/codex-telegram-bridge.git ~/.codex-telegram-bridge
+cd ~/.codex-telegram-bridge
 ./setup.sh
 ```
 
