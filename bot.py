@@ -34,8 +34,10 @@ from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
 from strings import COMMAND_DESCRIPTIONS, current_language, t
 from tenant_migration import apply_pending_tenant_migration
 from isolation import (TenantUnavailable, assert_empty_mcp, ensure_tenant, ensure_tenant_control,
-                       isolated_mcp_overrides, stage_tenant_control, tenant_control_dir,
+                       isolated_mcp_servers, isolated_mcp_overrides, stage_tenant_control, tenant_control_dir,
                        tenant_isolated, tenant_run_argv, workspace_for_state, workspace_relative)
+from tenant_exchange import (ExchangeRefusal, open_absolute_file, process_tenant_queue,
+                             receive_inbox_file)
 
 
 EDIT_THROTTLE_S = 1.3
@@ -435,6 +437,7 @@ class TenantRuntime:
 
 tenants = {}
 tenants_delegate = {}
+isolated_file_watchers = set()
 # A local getFile call may wait while telegram-bot-api fetches a large upload.
 # Each chat gets its own worker so that later updates cannot overtake that
 # download, while independent chats continue immediately.
@@ -452,6 +455,26 @@ def get_tenant(chat_id):
             runtime = TenantRuntime(chat_id)
             tenants[chat_id] = runtime
         return runtime
+
+
+def _isolated_file_send_watcher_loop(chat_id):
+    while True:
+        try:
+            process_tenant_queue(chat_id, ensure_tenant(chat_id, "main")["exchange"],
+                                 send_document, FILE_SEND_MAX_BYTES)
+        except Exception as exc:
+            log(f"tenant={chat_id} isolated file-send watcher: {type(exc).__name__}")
+        time.sleep(1)
+
+
+def _start_isolated_file_send_watcher(chat_id):
+    if not tenant_isolated(chat_id) or not isolated_mcp_servers(chat_id):
+        return
+    with process_lock:
+        if chat_id in isolated_file_watchers:
+            return
+        isolated_file_watchers.add(chat_id)
+    threading.Thread(target=_isolated_file_send_watcher_loop, args=(chat_id,), daemon=True).start()
 
 
 def get_delegate_tenant(chat_id):
@@ -907,6 +930,26 @@ def download_telegram_file(file_id, suggested_name="image.jpg", chat_id=None,
     remote_path = (result.get("result") or {}).get("file_path") if result.get("ok") else None
     if not remote_path:
         raise AttachmentDownloadError("get_file_failed", t("attachment_no_file_path"))
+    if chat_id is not None and tenant_isolated(chat_id):
+        try:
+            if LOCAL_BOT_API and os.path.isabs(remote_path):
+                source_fd = open_absolute_file(remote_path)
+                with os.fdopen(source_fd, "rb") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        raise AttachmentDownloadError("local_file_access", t("attachment_local_file_not_a_file"))
+                    path = receive_inbox_file(ensure_tenant(chat_id, "main")["exchange"],
+                                              suggested_name, source, max_bytes)
+                os.unlink(remote_path)
+                return path
+            with urllib.request.urlopen(f"{FILE_API_BASE}/{remote_path}", timeout=HTTP_TIMEOUT_S) as source:
+                return receive_inbox_file(ensure_tenant(chat_id, "main")["exchange"],
+                                          suggested_name, source, max_bytes)
+        except ExchangeRefusal as exc:
+            raise AttachmentDownloadError("too_big", t("attachment_too_big")) from exc
+        except AttachmentDownloadError:
+            raise
+        except Exception as exc:
+            raise _download_error_from_exception(exc) from exc
     suffix = Path(suggested_name).suffix or Path(remote_path).suffix or ".jpg"
     media_dir = tenant_upload_dir(chat_id) if chat_id is not None else (
         Path(tempfile.gettempdir()) / "codex-telegram-bot-media"
@@ -1140,7 +1183,7 @@ def message_inputs(message):
             return inputs, paths, failures
         paths.append(path)
         inlined = False
-        if textual and Path(path).stat().st_size <= TEXT_DOCUMENT_MAX_BYTES:
+        if textual and not tenant_isolated(chat_id) and Path(path).stat().st_size <= TEXT_DOCUMENT_MAX_BYTES:
             try:
                 contents = Path(path).read_text(encoding="utf-8")
             except UnicodeDecodeError:
@@ -1180,6 +1223,8 @@ def message_inputs(message):
         if not transcript:
             raise UnsupportedAttachmentError(t("attachment_voice_transcription_failed"))
         inputs.append({"type": "text", "text": f"[Расшифровка голосового сообщения]\n{transcript}"})
+        if tenant_isolated(chat_id):
+            inputs.append({"type": "text", "text": f"[Файл голосового сообщения: {path}]"})
 
     if not inputs and attachment_note:
         inputs.append({"type": "text", "text": "[Вложение: " + attachment_note + "]"})
@@ -1871,11 +1916,21 @@ def send_document(chat_id, path, caption=""):
 
 def _persona_path(chat_id):
     if tenant_isolated(chat_id):
-        return ensure_tenant_control(chat_id, _persona_template(chat_state(chat_id).get("language", "ru"))) / "persona.md"
+        return ensure_tenant_control(chat_id, _persona_template(chat_state(chat_id).get("language", "ru")),
+                                     _isolated_file_send_section(chat_id)) / "persona.md"
     path = ACCOUNTS_DIR / str(int(chat_id)) / "AGENTS.md"
     if not path.exists():
         tenant_codex_home(chat_id)
     return path
+
+
+def _isolated_file_send_section(chat_id):
+    server = isolated_mcp_servers(chat_id).get("send-telegram-file")
+    if server is None:
+        return None
+    outbox = os.path.join(server["env"]["TENANT_EXCHANGE_DIR"], "outbox")
+    return FILE_SEND_AGENTS_SECTION.replace("каталог из переменной `CODEX_TELEGRAM_OUTBOX`",
+                                            f"каталог `{outbox}`")
 
 
 def _write_persona(path, contents):
@@ -2463,18 +2518,22 @@ def get_app_server(runtime):
                     raise TenantUnavailable("one-turn environment is unavailable for isolated tenants")
                 def launch(command):
                     try:
+                        relative = workspace_for_state(chat_state(runtime.state_key).get("workspace"))
                         stage_tenant_control(
                             runtime.state_key, _persona_template(chat_state(runtime.chat_id).get("language", "ru")),
+                            _isolated_file_send_section(runtime.state_key),
                         )
-                        assert_empty_mcp(runtime.chat_id, kind)
+                        assert_empty_mcp(runtime.chat_id, kind, cwd=relative)
                         return tenant_run_argv(
                             runtime.chat_id, kind,
-                            cwd=workspace_for_state(chat_state(runtime.state_key).get("workspace")),
+                            cwd=relative,
                             env={"CHAT_ID": runtime.chat_id}, command=command[0], args=command[1:],
                         )
                     except (OSError, ValueError) as exc:
                         raise TenantUnavailable(f"tenant launch: {exc}") from exc
                 def check_mcp(request):
+                    expected = set(isolated_mcp_servers(runtime.state_key))
+                    seen = set()
                     cursor = None
                     while True:
                         params = {"limit": 100}
@@ -2484,14 +2543,24 @@ def get_app_server(runtime):
                             result = request("mcpServerStatus/list", params) or {}
                         except AppServerError as exc:
                             raise TenantUnavailable(f"tenant MCP status unavailable: {exc}") from exc
-                        if result.get("data"):
-                            raise TenantUnavailable("tenant app-server loaded an unapproved MCP server")
+                        data = result.get("data")
+                        if not isinstance(data, list):
+                            raise TenantUnavailable("tenant MCP status malformed")
+                        for entry in data:
+                            name = entry.get("name") if isinstance(entry, dict) else None
+                            if name not in expected or name in seen:
+                                raise TenantUnavailable("tenant app-server loaded an unapproved MCP server")
+                            seen.add(name)
                         next_cursor = result.get("nextCursor")
                         if not next_cursor:
-                            return
+                            break
                         if next_cursor == cursor:
                             raise TenantUnavailable("tenant MCP status pagination did not advance")
                         cursor = next_cursor
+                    if seen != expected:
+                        raise TenantUnavailable("tenant app-server is missing an approved MCP server")
+                    assert_empty_mcp(runtime.chat_id, kind,
+                                     cwd=workspace_for_state(chat_state(runtime.state_key).get("workspace")))
                 runtime.app_server = AppServerClient(
                     lambda method, params: handle_app_notification(runtime, method, params),
                     lambda message: log(f"tenant={runtime.chat_id} {message}"),
@@ -2962,11 +3031,12 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
             runtime.busy = False
             runtime.cancel_requested = False
             runtime.worker_done.set()
-        for path in paths:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+        if not tenant_isolated(runtime.chat_id):
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
 
 
 def run_compaction(runtime, thread_id):
@@ -3496,7 +3566,9 @@ def steer_current_turn(runtime, inputs, media_paths=None):
         return False, compact(str(exc), 500)
 
 
-def cleanup_media_paths(paths):
+def cleanup_media_paths(paths, chat_id=None):
+    if chat_id is not None and tenant_isolated(chat_id):
+        return
     for path in paths or []:
         try:
             os.unlink(path)
@@ -3532,7 +3604,7 @@ def cancel_pending_batch(runtime):
     if timer is not None:
         timer.cancel()
     cleanup_media_paths(
-        path for _, paths in entries for path in (paths or [])
+        (path for _, paths in entries for path in (paths or [])), runtime.chat_id,
     )
 
 
@@ -4599,6 +4671,7 @@ def handle_message(message):
             log(f"tenant={chat_id} unavailable: {exc}")
             send_plain(chat_id, t('tenant_unavailable'))
             return
+        _start_isolated_file_send_watcher(chat_id)
     owner_runtime = get_tenant(chat_id)
     raw_text = (
         message.get("text")
@@ -4745,6 +4818,12 @@ def main():
     threading.Thread(target=external_request_watcher, daemon=True).start()
     threading.Thread(target=cross_delegate_watcher, daemon=True).start()
     threading.Thread(target=file_send_queue_watcher, daemon=True).start()
+    for tenant_id in load_whitelist():
+        if tenant_id.isdecimal() and tenant_isolated(tenant_id):
+            try:
+                _start_isolated_file_send_watcher(int(tenant_id))
+            except TenantUnavailable as exc:
+                log(f"tenant={tenant_id} isolated file-send watcher unavailable: {exc}")
     threading.Thread(target=pending_delivery_watcher, daemon=True).start()
     retry_pending_deliveries()
     log(f"Codex Telegram bot started; owner={OWNER_ID}, cwd={CODEX_CWD}")

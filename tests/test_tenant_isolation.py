@@ -150,6 +150,68 @@ class TenantIsolationTests(unittest.TestCase):
             with self.assertRaises(isolation.TenantUnavailable):
                 client.launch_factory(["codex", "app-server"])
 
+    def test_expected_mcp_rejects_missing_extra_and_modified_entries(self):
+        self._on()
+        mcp_dir = self.root / "mcp"
+        mcp_dir.mkdir()
+        (mcp_dir / "codex_send_telegram_file_mcp.py").write_text("# fixture\n")
+        with patch.dict(os.environ, {"BRIDGE_ISOLATED_MCP_DIR": str(mcp_dir)}):
+            server = isolation.isolated_mcp_servers(2)["send-telegram-file"]
+            runtime = self.bot.get_tenant(2)
+            client = self.bot.get_app_server(runtime)
+            self.assertIn("TENANT_EXCHANGE_DIR", " ".join(client.config_overrides))
+            self.assertIn("CHAT_ID", " ".join(client.config_overrides))
+            entry = {"name": "send-telegram-file", "enabled": True,
+                     "transport": {"type": "stdio", **server, "env_vars": [], "cwd": None}}
+            def mock_list(entries, inherited=None):
+                def run(argv, **kwargs):
+                    raw = not any("mcp_servers.send-telegram-file.command" in str(part) for part in argv)
+                    return SimpleNamespace(returncode=0,
+                                           stdout=json.dumps((inherited or []) if raw else entries), stderr="")
+                return run
+            with patch.object(isolation.subprocess, "run", side_effect=mock_list([entry])):
+                client.launch_factory(["codex", "app-server"])
+                client.startup_check(lambda method, params: {"data": [{"name": "send-telegram-file"}]})
+                for data in ([], [{"name": "evil"}],
+                             [{"name": "send-telegram-file"}, {"name": "evil"}]):
+                    with self.assertRaises(isolation.TenantUnavailable):
+                        client.startup_check(lambda method, params, data=data: {"data": data})
+            for changed in ([], [dict(entry, name="evil")],
+                            [entry, dict(entry, name="evil")],
+                            [dict(entry, transport={**entry["transport"], "command": "/bin/false"})],
+                            [dict(entry, transport={**entry["transport"], "args": ["/tmp/evil"]})]):
+                with patch.object(isolation.subprocess, "run", side_effect=mock_list(changed)):
+                    with self.assertRaises(isolation.TenantUnavailable):
+                        client.launch_factory(["codex", "app-server"])
+                    with self.assertRaises(isolation.TenantUnavailable):
+                        client.startup_check(lambda method, params: {"data": [{"name": "send-telegram-file"}]})
+            with patch.object(isolation.subprocess, "run", side_effect=mock_list(
+                    [entry], [dict(entry, transport={**entry["transport"], "command": "/bin/false"})])):
+                with self.assertRaises(isolation.TenantUnavailable):
+                    client.launch_factory(["codex", "app-server"])
+            persona = self.bot._persona_path(2)
+            self.assertEqual(persona.read_text().count(self.bot.FILE_SEND_AGENTS_MARKER), 1)
+            self.assertIn(str(self.exchange / "outbox"), persona.read_text())
+            self.assertEqual(set(json.loads((self.control / "2" / "mcp.json").read_text())["mcpServers"]),
+                             {"send-telegram-file"})
+        self.bot._persona_path(2)
+        self.assertNotIn(self.bot.FILE_SEND_AGENTS_MARKER, persona.read_text())
+
+    def test_isolated_incoming_download_uses_inbox_and_keeps_file(self):
+        self._on()
+        (self.exchange / "inbox").mkdir()
+        source = self.root / "incoming"
+        source.write_bytes(b"hello")
+        with patch.object(self.bot, "LOCAL_BOT_API", True), \
+                patch.object(self.bot, "tg_call", return_value={"ok": True, "result": {"file_path": str(source)}}):
+            path = self.bot.download_telegram_file("file", "../unsafe\x00.txt", chat_id=2)
+        self.assertEqual(Path(path).parent, self.exchange / "inbox")
+        self.assertEqual(Path(path).read_bytes(), b"hello")
+        self.assertEqual(stat.S_IMODE(Path(path).stat().st_mode), 0o644)
+        self.bot.cleanup_media_paths([path], 2)
+        self.assertTrue(Path(path).exists())
+        self.assertFalse((self.root / "accounts" / "2" / "uploads").exists())
+
     def test_runner_refusal_with_empty_stdout_blocks_start(self):
         self._on()
         isolation.ensure_tenant(2)
