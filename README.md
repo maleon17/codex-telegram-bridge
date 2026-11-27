@@ -82,7 +82,15 @@ Put their numeric Telegram IDs into `whitelist.txt` (one per line or comma-separ
 
 Every additional user gets a separate Codex account, App Server, threads, limits and settings under `accounts/<telegram_id>/`. Removing an ID blocks new messages; their data stays on disk until you delete it.
 
-> **Security:** in `danger-full-access` Codex can do whatever the service's Linux user can, and every whitelisted user shares that Linux user. Whitelist only people you trust, prefer `workspace-write`, and use separate Linux users or containers if you need hard isolation.
+> **Security:** by default, `danger-full-access` lets every whitelisted user act as the service's Linux user. The optional Unix tenant mode below runs selected users under separate accounts.
+
+### Optional Unix tenant mode
+
+The mode is off by default. With the separately installed root-owned `tenant-provision` and `tenant-run` helpers, set `BRIDGE_ISOLATION=on` and a comma-separated `ISOLATED_TENANTS` list in the service environment. The bridge provisions selected tenants and launches their Codex App Servers through `sudo -n tenant-run` as the tenant's Unix user. If a helper refuses, the request stops and the user receives an error; the bridge does not start Codex under its own account. `BRIDGE_TENANT_PROVISION` and `BRIDGE_TENANT_RUN` override helper paths for testing.
+
+An isolated tenant's working directory is under its `workspace/`; `/workspace` stores a relative path there. The bridge does not open the tenant's Codex home for account status or sessions: account and limit requests, and `thread/list` for `/sessions` and `/resume`, go through that tenant's App Server. A separate delegate runtime uses the helper's `delegate` kind. Existing tenants outside the list retain the previous behavior.
+
+The bridge keeps its persona and MCP policy in `tenant_control/<tenant>/` (private to the bridge; `BRIDGE_TENANT_CONTROL_DIR` can relocate it). On each App Server launch it restores copies in the tenant's exchange directory and supplies the persona as App Server `developerInstructions`. The isolated MCP allowlist is empty at this stage. The bridge passes it using `-c` and refuses startup if Codex's effective MCP list contains a tenant-configured server. File exchange, attachments and cross-bridge delegation are separate work and are not enabled by this mode yet.
 
 ## Together with the rest of Telegram AI
 

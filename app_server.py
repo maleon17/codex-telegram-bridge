@@ -14,10 +14,14 @@ class AppServerClient:
     """Generation-safe JSONL client for a replaceable app-server process."""
 
     def __init__(self, notification_handler, log, request_timeout=30, env=None,
-                 config_overrides=()):
+                 config_overrides=(), launch_factory=None, exit_error_factory=None,
+                 startup_check=None):
         self.notification_handler, self.log = notification_handler, log
         self.request_timeout, self.env, self.process = request_timeout, env, None
         self.config_overrides = tuple(config_overrides)
+        self.launch_factory = launch_factory
+        self.exit_error_factory = exit_error_factory
+        self.startup_check = startup_check
         self._write_lock, self._state_lock = threading.Lock(), threading.Lock()
         self._pending, self._next_id, self._closed_error = {}, 1, None
         self._generation, self._ready, self._init_error, self._readers = 0, None, None, {}
@@ -34,10 +38,18 @@ class AppServerClient:
                 command = ["codex", "app-server", "--listen", "stdio://"]
                 for override in self.config_overrides:
                     command.extend(("-c", override))
-                process = subprocess.Popen(
-                    command, stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=self.env,
-                )
+                if self.launch_factory is None:
+                    process = subprocess.Popen(
+                        command, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=self.env,
+                    )
+                else:
+                    command = self.launch_factory(command)
+                    process = subprocess.Popen(
+                        command, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                        env={"PATH": "/usr/bin:/bin"}, cwd="/",
+                    )
                 self.process, ready, self._ready = process, threading.Event(), None
                 self._ready = ready
                 readers = (
@@ -62,8 +74,12 @@ class AppServerClient:
                 "capabilities": {"experimentalApi": True},
             }, generation=generation)
             self._notify(generation, "initialized")
+            if self.startup_check is not None:
+                self.startup_check(lambda method, params: self._request(method, params, generation=generation))
         except Exception as exc:
-            error = exc if isinstance(exc, AppServerError) else AppServerError(str(exc))
+            error = (exc if isinstance(exc, AppServerError)
+                     or (self.exit_error_factory is not None and isinstance(exc, RuntimeError))
+                     else AppServerError(str(exc)))
             with self._state_lock:
                 current = generation == self._generation and self.process is process
                 if current:
@@ -156,6 +172,9 @@ class AppServerClient:
                 process = self.process
                 if (generation != self._generation or process is None or process.poll() is not None
                         or process.stdin is None):
+                    if (process is not None and process.poll() is not None
+                            and self.exit_error_factory is not None):
+                        raise self.exit_error_factory(process.poll())
                     raise AppServerError(self._closed_error or "app-server is not running")
             process.stdin.write(payload + "\n")
             process.stdin.flush()
@@ -188,8 +207,9 @@ class AppServerClient:
                         except Exception as exc:
                             self.log(f"app-server notification handler failed: {exc}")
         finally:
-            self._fail_pending(generation, AppServerError(
-                f"app-server exited with status {process.poll()}"))
+            error = (self.exit_error_factory(process.poll()) if self.exit_error_factory is not None
+                     else AppServerError(f"app-server exited with status {process.poll()}"))
+            self._fail_pending(generation, error)
 
     def _read_stderr(self, process, generation):
         for line in process.stderr:

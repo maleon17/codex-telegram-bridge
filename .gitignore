@@ -10,5 +10,6 @@ external_request.json.delegate.lock
 cross_delegate_queue/
 cross_delegate_result/
 accounts/
+tenant_control/
 whitelist.txt
 .env

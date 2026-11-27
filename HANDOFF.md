@@ -88,6 +88,14 @@ default sandbox (`read-only` / `workspace-write` / `danger-full-access`), and
 paths for the state file, whitelist, per-account data dir, and restart-request
 file. `setup.sh` generates `.env` and the systemd unit.
 
+### Optional Unix tenant isolation
+
+`BRIDGE_ISOLATION=on` enables the mode for the comma-separated IDs in `ISOLATED_TENANTS`; it is off by default. The separately installed root-owned `tenant-provision` and `tenant-run` helpers create tenant homes and launch `codex app-server` under each selected tenant's Unix account. Their paths can be overridden with `BRIDGE_TENANT_PROVISION` and `BRIDGE_TENANT_RUN` for tests. Provision or launch refusal is fatal for that request. No bridge-user fallback is allowed.
+
+For selected tenants, workspace state is relative to the tenant's `workspace/` and turn/thread `cwd` is absolute inside it. Login, account status and limits use App Server requests under the tenant UID. `/sessions` and `/resume` use `thread/list` instead of scanning the tenant's Codex home. Bridge-owned persona and MCP policy live in private `tenant_control/<id>/` (override root with `BRIDGE_TENANT_CONTROL_DIR`); copies in the tenant exchange directory are restored before each App Server start. The persona is supplied through `developerInstructions` on `thread/start` and `thread/resume`; the isolated MCP list is currently empty and supplied by `-c`. The bridge refuses a tenant-configured MCP server detected by its startup preflight. File attachments and cross-bridge delegation are outside this stage.
+
+Run tests with a scratch home and a clean Bot API environment: `env -u TELEGRAM_API_URL -u TELEGRAM_AI_CONFIG_DIR HOME=<scratch> TELEGRAM_BOT_TOKEN=000000:test OWNER_ID=1 python3 -m unittest discover -s tests`. Tests that enable isolation override `BRIDGE_TENANT_CONTROL_DIR` and stub both helpers.
+
 ## Deploy protocol
 
 1. Edit `bot.py` / `app_server.py` / `telegram_format.py`.

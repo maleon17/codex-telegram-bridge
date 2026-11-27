@@ -248,6 +248,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'usage_window_reset': '{label}, сброс {reset}',
         'usage_window_weekly': 'недельный лимит',
         'workspace_missing': 'Директория не существует: {path}',
+        'tenant_unavailable': '⛔ Изолированный аккаунт сейчас недоступен. Сообщи владельцу бота.',
+        'tenant_workspace_invalid': 'Рабочая папка должна находиться внутри workspace этого аккаунта.',
         'workspace_usage': 'Workspace: {workspace}\nИспользование: /workspace <путь>|default',
     },
     "en": {
@@ -490,6 +492,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'usage_window_reset': '{label}, resets {reset}',
         'usage_window_weekly': 'weekly limit',
         'workspace_missing': 'Directory does not exist: {path}',
+        'tenant_unavailable': '⛔ This isolated account is unavailable. Contact the bot owner.',
+        'tenant_workspace_invalid': 'The working folder must stay inside this account’s workspace.',
         'workspace_usage': 'Workspace: {workspace}\nUsage: /workspace <path>|default',
     },
     "uk": {
@@ -732,6 +736,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'usage_window_reset': '{label}, скидання {reset}',
         'usage_window_weekly': 'тижневий ліміт',
         'workspace_missing': 'Каталогу не існує: {path}',
+        'tenant_unavailable': '⛔ Ізольований акаунт зараз недоступний. Звернися до власника бота.',
+        'tenant_workspace_invalid': 'Робоча папка має бути всередині workspace цього акаунта.',
         'workspace_usage': 'Workspace: {workspace}\nВикористання: /workspace <шлях>|default',
     },
     "kk": {
@@ -974,6 +980,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'usage_window_reset': '{label}, қалпына келуі {reset}',
         'usage_window_weekly': 'апталық лимит',
         'workspace_missing': 'Каталог жоқ: {path}',
+        'tenant_unavailable': '⛔ Оқшауланған аккаунт қазір қолжетімсіз. Бот иесіне хабарласыңыз.',
+        'tenant_workspace_invalid': 'Жұмыс бумасы осы аккаунттың workspace ішінде болуы керек.',
         'workspace_usage': 'Workspace: {workspace}\nҚолданылуы: /workspace <жол>|default',
     },
     "de": {
@@ -1216,6 +1224,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'usage_window_reset': '{label}, Zurücksetzung {reset}',
         'usage_window_weekly': 'Wochenlimit',
         'workspace_missing': 'Verzeichnis existiert nicht: {path}',
+        'tenant_unavailable': '⛔ Dieses isolierte Konto ist derzeit nicht verfügbar. Kontaktiere den Botbetreiber.',
+        'tenant_workspace_invalid': 'Der Arbeitsordner muss im workspace dieses Kontos liegen.',
         'workspace_usage': 'Workspace: {workspace}\nVerwendung: /workspace <Pfad>|default',
     },
 }

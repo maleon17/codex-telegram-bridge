@@ -85,6 +85,36 @@ class _ClosingProcess(_Process):
 
 
 class InitFailureTests(unittest.TestCase):
+    def test_isolated_runner_exit_is_reported_as_tenant_unavailable(self):
+        process = _ClosingProcess()
+        process._code = 1
+        process.stdout.items.put(None)
+        process.stderr.items.put(None)
+        with patch("app_server.subprocess.Popen", return_value=process):
+            client = AppServerClient(
+                lambda *args: None, lambda *args: None,
+                launch_factory=lambda command: command,
+                exit_error_factory=lambda status: RuntimeError(f"tenant unavailable: {status}"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "tenant unavailable: 1"):
+                client.start()
+
+    def test_launch_factory_uses_isolated_argv_and_minimal_environment(self):
+        with patch("app_server.subprocess.Popen", return_value=_ClosingProcess()) as spawn:
+            client = AppServerClient(
+                lambda *args: None, lambda *args: None,
+                config_overrides=("mcp_servers={}",),
+                launch_factory=lambda command: ["sudo", "-n", "/helper", "2", "--", *command],
+            )
+            client.start()
+            client.close(timeout=0.1)
+        self.assertEqual(spawn.call_args.args[0], [
+            "sudo", "-n", "/helper", "2", "--", "codex", "app-server", "--listen", "stdio://",
+            "-c", "mcp_servers={}",
+        ])
+        self.assertEqual(spawn.call_args.kwargs["cwd"], "/")
+        self.assertEqual(spawn.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin"})
+
     def test_config_overrides_reach_app_server_process(self):
         with patch("app_server.subprocess.Popen", return_value=_ClosingProcess()) as spawn:
             client = AppServerClient(

@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,9 @@ from telegram_actions_link import SERVER_NAME as TELEGRAM_ACTIONS_SERVER, resolv
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
 from strings import COMMAND_DESCRIPTIONS, current_language, t
 from tenant_migration import apply_pending_tenant_migration
+from isolation import (TenantUnavailable, assert_empty_mcp, ensure_tenant, ensure_tenant_control,
+                       isolated_mcp_overrides, stage_tenant_control, tenant_control_dir,
+                       tenant_isolated, tenant_run_argv, workspace_for_state, workspace_relative)
 
 
 EDIT_THROTTLE_S = 1.3
@@ -274,6 +278,8 @@ def _persona_template(language):
 
 
 def _persona_marker_path(chat_id):
+    if tenant_isolated(chat_id):
+        return tenant_control_dir(chat_id) / ".persona_default_sha256"
     return ACCOUNTS_DIR / str(int(chat_id)) / ".persona_default_sha256"
 
 
@@ -294,6 +300,15 @@ def _seed_default_persona(chat_id, language):
     contents = _persona_template(language)
     _write_persona(_persona_path(chat_id), contents)
     _mark_default_persona(chat_id, contents)
+    _invalidate_isolated_persona(chat_id)
+
+
+def _invalidate_isolated_persona(chat_id):
+    if tenant_isolated(chat_id):
+        runtime = get_tenant(real_chat_id(chat_id))
+        with process_lock:
+            runtime.loaded_thread_id = None
+            runtime.loaded_server_pid = None
 
 
 def _translate_persona_file(chat_id, target_lang):
@@ -302,7 +317,8 @@ def _translate_persona_file(chat_id, target_lang):
     original = path.read_text(encoding="utf-8")
     if not original.strip():
         raise ValueError("persona is empty")
-    tenant_home = path.parent
+    isolated = tenant_isolated(chat_id)
+    tenant_home = (Path(ensure_tenant(chat_id)["home"]) / "workspace" if isolated else path.parent)
     language = LANGUAGE_NAMES[target_lang]
     prompt = (
         f"Translate the following AGENTS.md content into {language}. Preserve its "
@@ -314,7 +330,8 @@ def _translate_persona_file(chat_id, target_lang):
         + original
     )
     with tempfile.TemporaryDirectory(prefix="persona-translation-") as temporary:
-        output_path = Path(temporary) / "result.md"
+        output_path = (Path(ensure_tenant(chat_id)["exchange"]) / f".persona-translation-{os.urandom(12).hex()}.md"
+                       if isolated else Path(temporary) / "result.md")
         translation_env = _child_base_env()
         translation_env["CODEX_HOME"] = str(tenant_home)
         command = [
@@ -329,14 +346,29 @@ def _translate_persona_file(chat_id, target_lang):
         selected_model = chat_state(chat_id).get("model")
         if selected_model:
             command[2:2] = ["--model", selected_model]
-        result = subprocess.run(
-            command, input=prompt, capture_output=True, text=True,
-            timeout=180, check=False,
-            env=translation_env,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(compact(result.stderr or result.stdout or "Codex failed", 500))
-        translated = output_path.read_text(encoding="utf-8").strip()
+        if isolated:
+            command = tenant_run_argv(chat_id, "main", command="codex", args=command[1:])
+            translation_env = {"PATH": "/usr/bin:/bin"}
+        try:
+            run_options = {"input": prompt, "capture_output": True, "text": True,
+                           "timeout": 180, "check": False, "env": translation_env}
+            if isolated:
+                run_options["cwd"] = "/"
+            result = subprocess.run(command, **run_options)
+            if result.returncode != 0:
+                raise RuntimeError(compact(result.stderr or result.stdout or "Codex failed", 500))
+            if isolated:
+                fd = os.open(output_path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                        raise ValueError("invalid persona translation output")
+                    translated = handle.read(1024 * 1024 + 1).decode("utf-8").strip()
+            else:
+                translated = output_path.read_text(encoding="utf-8").strip()
+        finally:
+            if isolated:
+                output_path.unlink(missing_ok=True)
     refusal = re.match(r"(?i)^(?:sorry|i cannot|i can't|unable to)\b", translated)
     original_has_headings = any(line.startswith("#") for line in original.splitlines())
     translated_has_headings = any(line.startswith("#") for line in translated.splitlines())
@@ -345,6 +377,7 @@ def _translate_persona_file(chat_id, target_lang):
             or refusal or (original_has_headings and not translated_has_headings)):
         raise ValueError("Codex returned incomplete persona content")
     _write_persona(path, translated + "\n")
+    _invalidate_isolated_persona(chat_id)
 
 
 def delegate_key(chat_id):
@@ -378,6 +411,7 @@ class TenantRuntime:
         self.active_media_paths = []
         self.last_rate_limits = None
         self.login_id = None
+        self.account_ready_until = 0.0
         # Rapid Telegram updates (most visibly a multi-message forward) are
         # held briefly and dispatched as one prompt instead of starting one
         # Codex turn per update.
@@ -668,6 +702,10 @@ def tenant_codex_home(chat_id, state_key=None):
     """Return a tenant home; delegates share auth/config, not session files."""
     chat_id = int(chat_id)
     delegated = state_key is not None and str(state_key) != str(chat_id)
+    if tenant_isolated(chat_id):
+        # The bridge cannot traverse this directory; provisioning owns it.
+        info = ensure_tenant(chat_id, "delegate" if delegated else "main")
+        return Path(info["home"]) / ".codex-bridge"
     if delegated:
         path = ACCOUNTS_DIR / "delegated" / str(chat_id)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1186,7 +1224,9 @@ def chat_state(chat_id):
         entry.setdefault("model", None)
         entry.setdefault("effort", None)
         entry.setdefault("sandbox", CODEX_SANDBOX)
-        entry.setdefault("workspace", CODEX_CWD)
+        entry.setdefault("workspace", "workspace" if tenant_isolated(chat_id) else CODEX_CWD)
+        if tenant_isolated(chat_id):
+            entry["workspace"] = workspace_for_state(entry["workspace"])
         entry.setdefault("last_usage", None)
         entry.setdefault("session_usage", None)
         entry.setdefault("context_window", None)
@@ -1196,6 +1236,12 @@ def chat_state(chat_id):
 
 
 def update_state(chat_id=OWNER_ID, **values):
+    if "workspace" in values and tenant_isolated(chat_id):
+        if values["workspace"]:
+            info = ensure_tenant(chat_id)
+            values["workspace"] = workspace_relative(values["workspace"], info["home"])
+        else:
+            values["workspace"] = "workspace"
     with state_lock:
         state_db["chats"].setdefault(str(chat_id), {}).update(values)
         _save_state_locked()
@@ -1824,6 +1870,8 @@ def send_document(chat_id, path, caption=""):
 
 
 def _persona_path(chat_id):
+    if tenant_isolated(chat_id):
+        return ensure_tenant_control(chat_id, _persona_template(chat_state(chat_id).get("language", "ru"))) / "persona.md"
     path = ACCOUNTS_DIR / str(int(chat_id)) / "AGENTS.md"
     if not path.exists():
         tenant_codex_home(chat_id)
@@ -2408,8 +2456,52 @@ def get_app_server(runtime):
         if runtime.app_server is None:
             extra_env = runtime.pending_env
             runtime.pending_env = None
-            env = codex_process_env(runtime, extra_env=extra_env)
             runtime.close_app_server_after_turn = bool(extra_env)
+            if tenant_isolated(runtime.chat_id):
+                kind = "delegate" if runtime.state_key != str(runtime.chat_id) else "main"
+                if extra_env:
+                    raise TenantUnavailable("one-turn environment is unavailable for isolated tenants")
+                def launch(command):
+                    try:
+                        stage_tenant_control(
+                            runtime.state_key, _persona_template(chat_state(runtime.chat_id).get("language", "ru")),
+                        )
+                        assert_empty_mcp(runtime.chat_id, kind)
+                        return tenant_run_argv(
+                            runtime.chat_id, kind,
+                            cwd=workspace_for_state(chat_state(runtime.state_key).get("workspace")),
+                            env={"CHAT_ID": runtime.chat_id}, command=command[0], args=command[1:],
+                        )
+                    except (OSError, ValueError) as exc:
+                        raise TenantUnavailable(f"tenant launch: {exc}") from exc
+                def check_mcp(request):
+                    cursor = None
+                    while True:
+                        params = {"limit": 100}
+                        if cursor:
+                            params["cursor"] = cursor
+                        try:
+                            result = request("mcpServerStatus/list", params) or {}
+                        except AppServerError as exc:
+                            raise TenantUnavailable(f"tenant MCP status unavailable: {exc}") from exc
+                        if result.get("data"):
+                            raise TenantUnavailable("tenant app-server loaded an unapproved MCP server")
+                        next_cursor = result.get("nextCursor")
+                        if not next_cursor:
+                            return
+                        if next_cursor == cursor:
+                            raise TenantUnavailable("tenant MCP status pagination did not advance")
+                        cursor = next_cursor
+                runtime.app_server = AppServerClient(
+                    lambda method, params: handle_app_notification(runtime, method, params),
+                    lambda message: log(f"tenant={runtime.chat_id} {message}"),
+                    config_overrides=isolated_mcp_overrides(runtime.state_key), launch_factory=launch,
+                    exit_error_factory=lambda status: TenantUnavailable(
+                        f"tenant app-server exited with status {status}"),
+                    startup_check=check_mcp,
+                )
+                return runtime.app_server
+            env = codex_process_env(runtime, extra_env=extra_env)
             config_overrides = [
                 f'mcp_servers.send-telegram-file.env.CHAT_ID="{runtime.chat_id}"',
             ]
@@ -2563,7 +2655,7 @@ def _thread_params(runtime, thread_id=None):
     with state_lock:
         snapshot = dict(chat_state(runtime.state_key))
     params = {
-        "cwd": snapshot.get("workspace") or CODEX_CWD,
+        "cwd": runtime_workspace(runtime, snapshot),
         "sandbox": snapshot.get("sandbox") or CODEX_SANDBOX,
         "approvalPolicy": "never",
     }
@@ -2571,7 +2663,17 @@ def _thread_params(runtime, thread_id=None):
         params["model"] = snapshot["model"]
     if thread_id:
         params["threadId"] = thread_id
+    if tenant_isolated(runtime.chat_id):
+        params["developerInstructions"] = _persona_path(runtime.state_key).read_text(encoding="utf-8")
     return params
+
+
+def runtime_workspace(runtime, snapshot=None):
+    snapshot = snapshot or chat_state(runtime.state_key)
+    if tenant_isolated(runtime.chat_id):
+        info = ensure_tenant(runtime.chat_id, "delegate" if runtime.state_key != str(runtime.chat_id) else "main")
+        return os.path.join(info["home"], workspace_for_state(snapshot.get("workspace")))
+    return snapshot.get("workspace") or CODEX_CWD
 
 
 def available_models(runtime):
@@ -2797,11 +2899,11 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
         params = {
             "threadId": server_thread_id,
             "input": inputs,
-            "cwd": snapshot.get("workspace") or CODEX_CWD,
+            "cwd": runtime_workspace(runtime, snapshot),
             "approvalPolicy": "never",
             "sandboxPolicy": sandbox_policy(
                 snapshot.get("sandbox") or CODEX_SANDBOX,
-                snapshot.get("workspace") or CODEX_CWD,
+                runtime_workspace(runtime, snapshot),
             ),
         }
         if snapshot.get("model"):
@@ -2835,7 +2937,8 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
         view.deliver(stopped=stopped and not error, error=error)
     except Exception as exc:
         log(f"Codex worker failed: {exc}")
-        view.deliver(error=compact(str(exc), 1000))
+        view.deliver(error=t('tenant_unavailable') if isinstance(exc, TenantUnavailable)
+                     else compact(str(exc), 1000))
     finally:
         with process_lock:
             if runtime.close_app_server_after_turn:
@@ -2922,12 +3025,30 @@ def session_files(runtime_or_chat_id=OWNER_ID, state_key=None):
         state_key = runtime_or_chat_id.state_key
     else:
         chat_id = int(runtime_or_chat_id)
+    if tenant_isolated(chat_id):
+        runtime = (runtime_or_chat_id if isinstance(runtime_or_chat_id, TenantRuntime)
+                   else get_delegate_tenant(chat_id) if state_key and str(state_key) != str(chat_id)
+                   else get_tenant(chat_id))
+        client = get_app_server(runtime)
+        rows, cursor = [], None
+        for _ in range(10):
+            params = {"limit": 100, "sortKey": "recency_at", "sourceKinds": ["appServer"]}
+            if cursor:
+                params["cursor"] = cursor
+            result = client.request("thread/list", params, timeout=30) or {}
+            rows.extend(result.get("data") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        return rows
     codex_home = tenant_codex_home(chat_id, state_key=state_key)
     root = (codex_home or default_codex_home()) / "sessions"
     return sorted(root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def session_info(path):
+    if isinstance(path, dict):
+        return str(path.get("id") or ""), compact(str(path.get("preview") or path.get("name") or ""), 55)
     sid, preview = path.stem, ""
     try:
         with path.open(encoding="utf-8") as handle:
@@ -2950,6 +3071,19 @@ def session_info(path):
 def session_message_count(runtime_or_chat_id, thread_id, state_key=None):
     if not thread_id:
         return None
+    chat_id = runtime_or_chat_id.chat_id if isinstance(runtime_or_chat_id, TenantRuntime) else int(runtime_or_chat_id)
+    if tenant_isolated(chat_id):
+        runtime = (runtime_or_chat_id if isinstance(runtime_or_chat_id, TenantRuntime)
+                   else get_delegate_tenant(chat_id) if state_key and str(state_key) != str(chat_id)
+                   else get_tenant(chat_id))
+        try:
+            result = get_app_server(runtime).request(
+                "thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=30,
+            ) or {}
+            turns = (result.get("thread") or {}).get("turns")
+            return len(turns) if isinstance(turns, list) else None
+        except Exception:
+            return None
     for path in session_files(runtime_or_chat_id, state_key=state_key):
         sid, _ = session_info(path)
         if sid != thread_id:
@@ -3649,6 +3783,7 @@ def start_account_login(runtime):
     if runtime.chat_id == OWNER_ID:
         send_plain(runtime.chat_id, t('login_owner_not_needed'))
         return
+    runtime.account_ready_until = 0.0
     try:
         client = get_app_server(runtime)
         client.start_if_needed()
@@ -3661,6 +3796,10 @@ def start_account_login(runtime):
             runtime.chat_id,
             t('login_device_instructions', verification_url=result.get('verificationUrl'), user_code=result.get('userCode')),
         )
+    except TenantUnavailable as exc:
+        log(f"tenant={runtime.chat_id} login unavailable: {exc}")
+        update_state(runtime.state_key, account_status="login_failed")
+        send_plain(runtime.chat_id, t('tenant_unavailable'))
     except Exception as exc:
         update_state(runtime.state_key, account_status="login_failed")
         send_plain(runtime.chat_id, t('login_start_error', error=compact(str(exc), 500)))
@@ -3672,11 +3811,17 @@ def account_status_report(runtime):
         account = result.get("account") or {}
         if not account:
             update_state(runtime.state_key, account_status=None)
+            if tenant_isolated(runtime.chat_id):
+                runtime.account_ready_until = 0.0
             return t("account_not_connected")
         update_state(runtime.state_key, account_status="ready")
+        if tenant_isolated(runtime.chat_id):
+            runtime.account_ready_until = time.monotonic() + 30
         label = account.get("email") or account.get("type") or t("account_connected")
         plan = account.get("planType") or account.get("plan_type")
         return t("account_summary", label=label) + (t("account_plan_line", plan=plan) if plan else "")
+    except TenantUnavailable:
+        return t('tenant_unavailable')
     except Exception as exc:
         return t("account_read_error", error=compact(str(exc), 500))
 
@@ -3684,13 +3829,19 @@ def account_status_report(runtime):
 def account_is_ready(runtime):
     if runtime.chat_id == OWNER_ID:
         return True
+    if tenant_isolated(runtime.chat_id) and time.monotonic() < runtime.account_ready_until:
+        return True
     try:
         result = get_app_server(runtime).request(
             "account/read", {"refreshToken": False}, timeout=30,
         ) or {}
         ready = bool(result.get("account"))
+        if tenant_isolated(runtime.chat_id):
+            runtime.account_ready_until = time.monotonic() + 30 if ready else 0.0
         update_state(runtime.state_key, account_status="ready" if ready else None)
         return ready
+    except TenantUnavailable:
+        raise
     except Exception as exc:
         log(f"tenant={runtime.chat_id} account readiness check failed: {exc}")
         return False
@@ -4006,6 +4157,8 @@ def handle_command(chat_id, command, runtime=None):
     raw_cmd, _, arg = command.partition(" ")
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
+    if tenant_isolated(chat_id) and cmd in {"account", "status", "usage", "model", "effort", "sessions", "resume", "compact"}:
+        get_app_server(runtime).start_if_needed()
     if cmd in ("start", "help"):
         send_plain(chat_id, t('help_intro'))
         return True
@@ -4062,9 +4215,10 @@ def handle_command(chat_id, command, runtime=None):
         # The delegation footer nevertheless offers /resume, so search both
         # stores and remember which runtime owns the selected session.
         owner_runtime = get_tenant(chat_id)
-        delegate_runtime = get_delegate_tenant(chat_id)
+        delegate_runtime = (tenants_delegate.get(chat_id) if tenant_isolated(chat_id) and chat_id != OWNER_ID
+                            else get_delegate_tenant(chat_id))
         matches = []
-        for candidate_runtime in (owner_runtime, delegate_runtime):
+        for candidate_runtime in (owner_runtime, delegate_runtime) if delegate_runtime else (owner_runtime,):
             matches.extend(
                 (candidate_runtime, sid)
                 for path in session_files(candidate_runtime)
@@ -4083,14 +4237,17 @@ def handle_command(chat_id, command, runtime=None):
                 target_runtime.state_key, thread_id=thread_id, last_usage=None,
                 session_usage=None, context_window=None,
             )
-            update_state(
-                delegate_runtime.state_key,
-                resume_selected=(target_runtime is delegate_runtime),
-            )
+            if delegate_runtime is not None:
+                update_state(
+                    delegate_runtime.state_key,
+                    resume_selected=(target_runtime is delegate_runtime),
+                )
             kind = t("resume_delegated_kind") if target_runtime is delegate_runtime else ""
             send_plain(chat_id, t('resume_success', kind=kind, thread_id=thread_id[:8]))
         return True
     if cmd == "status":
+        if tenant_isolated(chat_id):
+            account_status_report(runtime)
         try:
             selected_model(runtime)
         except Exception as exc:
@@ -4186,6 +4343,23 @@ def handle_command(chat_id, command, runtime=None):
             send_plain(chat_id, t('mode_selected', mode=aliases[arg]))
         return True
     if cmd == "workspace":
+        if tenant_isolated(chat_id):
+            if not arg:
+                send_plain(chat_id, t('workspace_usage', workspace=chat_state(state_key).get('workspace')))
+                return True
+            info = ensure_tenant(chat_id, "delegate" if state_key != str(chat_id) else "main")
+            try:
+                relative = ("workspace" if arg.lower() == "default"
+                            else workspace_relative(arg, info["home"]))
+            except ValueError:
+                send_plain(chat_id, t('tenant_workspace_invalid'))
+                return True
+            assert_empty_mcp(chat_id, "delegate" if state_key != str(chat_id) else "main", cwd=relative)
+            if chat_state(state_key).get("workspace") != relative:
+                cancel_pending_batch(runtime)
+            update_state(state_key, workspace=relative)
+            send_plain(chat_id, t('workspace_selected', path=relative))
+            return True
         path = CODEX_CWD if arg.lower() == "default" else os.path.abspath(os.path.expanduser(arg))
         if not arg:
             send_plain(chat_id, t('workspace_usage', workspace=chat_state(state_key).get('workspace')))
@@ -4418,6 +4592,13 @@ def handle_message(message):
         if chat_id:
             send_plain(chat_id, t('access_denied'))
         return
+    if tenant_isolated(chat_id):
+        try:
+            ensure_tenant(chat_id)
+        except TenantUnavailable as exc:
+            log(f"tenant={chat_id} unavailable: {exc}")
+            send_plain(chat_id, t('tenant_unavailable'))
+            return
     owner_runtime = get_tenant(chat_id)
     raw_text = (
         message.get("text")
@@ -4454,18 +4635,30 @@ def handle_message(message):
     if text.startswith(("/", ".")) and not forwarded and not rich_message and not has_media:
         command_name = text.split(None, 1)[0].split("@", 1)[0].lstrip("/.").lower()
         command_runtime = active_delegate_tenant(chat_id) or owner_runtime
-        handle_command(chat_id, text, runtime=command_runtime)
+        try:
+            handle_command(chat_id, text, runtime=command_runtime)
+        except TenantUnavailable as exc:
+            log(f"tenant={chat_id} command unavailable: {exc}")
+            send_plain(chat_id, t('tenant_unavailable'))
         return
     runtime = active_delegate_tenant(chat_id) or owner_runtime
     account_status = chat_state(runtime.state_key).get("account_status")
-    if (chat_id != OWNER_ID and account_status != "ready"
-            and (account_status == "awaiting_display_name" or not account_is_ready(runtime))):
+    try:
+        account_needed = (chat_id != OWNER_ID and
+                          (account_status == "awaiting_display_name" or
+                           ((tenant_isolated(chat_id) or account_status != "ready")
+                            and not account_is_ready(runtime))))
+    except TenantUnavailable as exc:
+        log(f"tenant={chat_id} account unavailable: {exc}")
+        send_plain(chat_id, t('tenant_unavailable'))
+        return
+    if account_needed:
         if account_status == "awaiting_login":
             send_plain(chat_id, t('login_complete_first'))
         elif account_status == "awaiting_display_name":
-            tenant_dir = tenant_codex_home(chat_id)
-            if tenant_dir is not None:
-                agents_path = tenant_dir / "AGENTS.md"
+            tenant_dir = None if tenant_isolated(chat_id) else tenant_codex_home(chat_id)
+            if tenant_dir is not None or tenant_isolated(chat_id):
+                agents_path = _persona_path(chat_id)
                 try:
                     personality = agents_path.read_text(encoding="utf-8")
                 except FileNotFoundError:
@@ -4476,6 +4669,7 @@ def handle_message(message):
                     _write_persona(agents_path, updated)
                     if was_default:
                         _mark_default_persona(chat_id, updated)
+                    _invalidate_isolated_persona(chat_id)
             update_state(runtime.state_key, account_status="ready")
             send_plain(chat_id, t('name_remembered'))
         else:
