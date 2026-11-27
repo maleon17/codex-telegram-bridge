@@ -207,7 +207,7 @@ def _process_tenant_queue_open(chat_id, exchange, send_document, max_bytes, queu
     with os.scandir(queue_fd) as entries:
         names = []
         for entry in entries:
-            if entry.name.endswith(".json"):
+            if UUID_JSON.fullmatch(entry.name):
                 names.append(entry.name)
                 if len(names) >= REQUESTS_PER_TENANT_PASS:
                     break

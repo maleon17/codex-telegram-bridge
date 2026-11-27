@@ -99,8 +99,24 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertEqual(params["developerInstructions"], persona.read_text())
         delegate = self.bot.get_delegate_tenant(2)
         argv = self.bot.get_app_server(delegate).launch_factory(command)
-        self.assertEqual(argv[5], "delegate")
+        self.assertEqual(argv[5:8], ["main", "--product", "delegate"])
         self.assertTrue((self.control / "2" / "delegate" / "persona.md").exists())
+        self.assertTrue((self.exchange / "persona.delegate.md").exists())
+        self.assertTrue((self.exchange / "mcp.delegate.json").exists())
+        self.assertEqual(self.bot.tenant_codex_home(2, delegate.state_key), self.home / ".codex-delegate")
+        delegate_params = self.bot._thread_params(delegate)
+        self.assertEqual(delegate_params["developerInstructions"],
+                         (self.control / "2" / "delegate" / "persona.md").read_text())
+        self.assertEqual(delegate_params["cwd"], str(self.home / "workspace"))
+        class DelegateClient:
+            def request(self, method, params=None, timeout=None):
+                self_method.append(method)
+                return {"data": [{"id": "delegate-thread"}]} if method == "thread/list" else {"account": {"type": "chatgpt"}}
+        self_method = []
+        with patch.object(self.bot, "get_app_server", return_value=DelegateClient()):
+            self.assertEqual(self.bot.session_files(delegate)[0]["id"], "delegate-thread")
+            self.assertIn("chatgpt", self.bot.account_status_report(delegate))
+        self.assertEqual(self_method, ["thread/list", "account/read"])
 
     def test_provision_refusal_sends_localized_message_and_stops(self):
         self._on()

@@ -150,8 +150,8 @@ def _wait_for_final(final, wait_seconds):
     return None
 
 
-def _delegate_request(prompt, wait_seconds=DEFAULT_WAIT_S):
-    raw_chat_id = os.environ.get("CHAT_ID", "")
+def _delegate_request(prompt, wait_seconds=DEFAULT_WAIT_S, chat_id=None):
+    raw_chat_id = os.environ.get("CHAT_ID", "") if chat_id is None else chat_id
     try:
         chat_id = int(raw_chat_id)
     except (TypeError, ValueError):

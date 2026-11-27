@@ -35,9 +35,10 @@ from strings import COMMAND_DESCRIPTIONS, current_language, t
 from tenant_migration import apply_pending_tenant_migration
 from isolation import (TenantUnavailable, assert_empty_mcp, ensure_tenant, ensure_tenant_control,
                        isolated_mcp_servers, isolated_mcp_overrides, stage_tenant_control, tenant_control_dir,
-                       tenant_isolated, tenant_run_argv, workspace_for_state, workspace_relative)
+                       tenant_isolated, tenant_run_argv, tenant_target, workspace_for_state, workspace_relative)
 from tenant_exchange import (ExchangeRefusal, open_absolute_file, process_tenant_queue,
                              receive_inbox_file)
+from tenant_delegate_exchange import process_tenant_delegate_queue
 
 
 EDIT_THROTTLE_S = 1.3
@@ -438,6 +439,7 @@ class TenantRuntime:
 tenants = {}
 tenants_delegate = {}
 isolated_file_watchers = set()
+isolated_delegate_watchers = set()
 # A local getFile call may wait while telegram-bot-api fetches a large upload.
 # Each chat gets its own worker so that later updates cannot overtake that
 # download, while independent chats continue immediately.
@@ -468,13 +470,32 @@ def _isolated_file_send_watcher_loop(chat_id):
 
 
 def _start_isolated_file_send_watcher(chat_id):
-    if not tenant_isolated(chat_id) or not isolated_mcp_servers(chat_id):
+    if not tenant_isolated(chat_id) or "send-telegram-file" not in isolated_mcp_servers(chat_id):
         return
     with process_lock:
         if chat_id in isolated_file_watchers:
             return
         isolated_file_watchers.add(chat_id)
     threading.Thread(target=_isolated_file_send_watcher_loop, args=(chat_id,), daemon=True).start()
+
+
+def _isolated_delegate_watcher_loop(chat_id):
+    while True:
+        try:
+            process_tenant_delegate_queue(str(chat_id), ensure_tenant(chat_id)["exchange"])
+        except Exception as exc:
+            log(f"tenant={chat_id} isolated delegation watcher: {type(exc).__name__}")
+        time.sleep(1)
+
+
+def _start_isolated_delegate_watcher(chat_id):
+    if not tenant_isolated(chat_id) or "delegate-to-claude" not in isolated_mcp_servers(chat_id):
+        return
+    with process_lock:
+        if chat_id in isolated_delegate_watchers:
+            return
+        isolated_delegate_watchers.add(chat_id)
+    threading.Thread(target=_isolated_delegate_watcher_loop, args=(chat_id,), daemon=True).start()
 
 
 def get_delegate_tenant(chat_id):
@@ -727,8 +748,10 @@ def tenant_codex_home(chat_id, state_key=None):
     delegated = state_key is not None and str(state_key) != str(chat_id)
     if tenant_isolated(chat_id):
         # The bridge cannot traverse this directory; provisioning owns it.
-        info = ensure_tenant(chat_id, "delegate" if delegated else "main")
-        return Path(info["home"]) / ".codex-bridge"
+        target = delegate_key(chat_id) if delegated else chat_id
+        kind, product = tenant_target(target)
+        info = ensure_tenant(target, kind)
+        return Path(info["home"]) / (".codex-delegate" if product == "delegate" else ".codex-bridge")
     if delegated:
         path = ACCOUNTS_DIR / "delegated" / str(chat_id)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2513,7 +2536,7 @@ def get_app_server(runtime):
             runtime.pending_env = None
             runtime.close_app_server_after_turn = bool(extra_env)
             if tenant_isolated(runtime.chat_id):
-                kind = "delegate" if runtime.state_key != str(runtime.chat_id) else "main"
+                kind, _ = tenant_target(runtime.state_key)
                 if extra_env:
                     raise TenantUnavailable("one-turn environment is unavailable for isolated tenants")
                 def launch(command):
@@ -2523,9 +2546,9 @@ def get_app_server(runtime):
                             runtime.state_key, _persona_template(chat_state(runtime.chat_id).get("language", "ru")),
                             _isolated_file_send_section(runtime.state_key),
                         )
-                        assert_empty_mcp(runtime.chat_id, kind, cwd=relative)
+                        assert_empty_mcp(runtime.state_key, kind, cwd=relative)
                         return tenant_run_argv(
-                            runtime.chat_id, kind,
+                            runtime.state_key, kind,
                             cwd=relative,
                             env={"CHAT_ID": runtime.chat_id}, command=command[0], args=command[1:],
                         )
@@ -2559,7 +2582,7 @@ def get_app_server(runtime):
                         cursor = next_cursor
                     if seen != expected:
                         raise TenantUnavailable("tenant app-server is missing an approved MCP server")
-                    assert_empty_mcp(runtime.chat_id, kind,
+                    assert_empty_mcp(runtime.state_key, kind,
                                      cwd=workspace_for_state(chat_state(runtime.state_key).get("workspace")))
                 runtime.app_server = AppServerClient(
                     lambda method, params: handle_app_notification(runtime, method, params),
@@ -2740,7 +2763,7 @@ def _thread_params(runtime, thread_id=None):
 def runtime_workspace(runtime, snapshot=None):
     snapshot = snapshot or chat_state(runtime.state_key)
     if tenant_isolated(runtime.chat_id):
-        info = ensure_tenant(runtime.chat_id, "delegate" if runtime.state_key != str(runtime.chat_id) else "main")
+        info = ensure_tenant(runtime.state_key)
         return os.path.join(info["home"], workspace_for_state(snapshot.get("workspace")))
     return snapshot.get("workspace") or CODEX_CWD
 
@@ -4419,14 +4442,14 @@ def handle_command(chat_id, command, runtime=None):
             if not arg:
                 send_plain(chat_id, t('workspace_usage', workspace=chat_state(state_key).get('workspace')))
                 return True
-            info = ensure_tenant(chat_id, "delegate" if state_key != str(chat_id) else "main")
+            info = ensure_tenant(state_key)
             try:
                 relative = ("workspace" if arg.lower() == "default"
                             else workspace_relative(arg, info["home"]))
             except ValueError:
                 send_plain(chat_id, t('tenant_workspace_invalid'))
                 return True
-            assert_empty_mcp(chat_id, "delegate" if state_key != str(chat_id) else "main", cwd=relative)
+            assert_empty_mcp(state_key, tenant_target(state_key)[0], cwd=relative)
             if chat_state(state_key).get("workspace") != relative:
                 cancel_pending_batch(runtime)
             update_state(state_key, workspace=relative)
@@ -4672,6 +4695,7 @@ def handle_message(message):
             send_plain(chat_id, t('tenant_unavailable'))
             return
         _start_isolated_file_send_watcher(chat_id)
+        _start_isolated_delegate_watcher(chat_id)
     owner_runtime = get_tenant(chat_id)
     raw_text = (
         message.get("text")
@@ -4822,6 +4846,7 @@ def main():
         if tenant_id.isdecimal() and tenant_isolated(tenant_id):
             try:
                 _start_isolated_file_send_watcher(int(tenant_id))
+                _start_isolated_delegate_watcher(int(tenant_id))
             except TenantUnavailable as exc:
                 log(f"tenant={tenant_id} isolated file-send watcher unavailable: {exc}")
     threading.Thread(target=pending_delivery_watcher, daemon=True).start()

@@ -30,6 +30,16 @@ def tenant_identity(chat_id):
     return (value.removeprefix("delegate:"), "delegate" if value.startswith("delegate:") else "main")
 
 
+def tenant_target(chat_id):
+    """Map a chat slot to the provision kind and runner product."""
+    tenant_id, slot = tenant_identity(chat_id)
+    if slot == "main":
+        return "main", "bridge"
+    if tenant_id == os.environ.get("OWNER_ID"):
+        return "delegate", "bridge"
+    return "main", "delegate"
+
+
 def tenant_isolated(chat_id):
     tenant_id, _ = tenant_identity(chat_id)
     return BRIDGE_ISOLATION == "on" and tenant_id in ISOLATED_TENANTS
@@ -37,7 +47,10 @@ def tenant_isolated(chat_id):
 
 def ensure_tenant(chat_id, kind=None):
     tenant_id, inferred_kind = tenant_identity(chat_id)
-    kind = kind or inferred_kind
+    target_kind = tenant_target(chat_id)[0]
+    if tenant_isolated(chat_id) and kind is not None and kind != target_kind:
+        raise TenantUnavailable("tenant kind differs from target")
+    kind = (target_kind if tenant_isolated(chat_id) else inferred_kind) if kind is None else kind
     if not tenant_id.isdecimal() or kind not in ("main", "delegate"):
         raise TenantUnavailable("invalid tenant identity")
     key = (tenant_id, kind)
@@ -89,12 +102,18 @@ def workspace_for_state(value):
     return "workspace"
 
 
-def tenant_run_argv(chat_id, kind, cwd="workspace", env=None, command="codex", args=()):
+def tenant_run_argv(chat_id, kind=None, cwd="workspace", env=None, command="codex", args=()):
     tenant_id, _ = tenant_identity(chat_id)
-    info = ensure_tenant(tenant_id, kind)
+    target_kind, product = tenant_target(chat_id)
+    if tenant_isolated(chat_id):
+        kind = target_kind
+    else:
+        kind = tenant_identity(chat_id)[1] if kind is None else kind
+        product = "bridge"
+    info = ensure_tenant(chat_id, kind)
     relative = workspace_relative(cwd, info["home"])
     argv = ["sudo", "-n", BRIDGE_TENANT_RUN, tenant_id, "--kind", kind,
-            "--product", "bridge", "--cwd", relative]
+            "--product", product, "--cwd", relative]
     allowed = {"CHAT_ID", "INSTANCE_ID", "TOPIC_ID", "EXCLUDE_MSG_ID",
                "CLAUDE_TELEGRAM_OUTBOX", "MAX_THINKING_TOKENS"}
     for key, value in (env or {}).items():
@@ -154,18 +173,28 @@ def atomic_control_write(path, contents, mode):
 def isolated_mcp_servers(chat_id):
     """Single bridge-controlled list of servers for this tenant process."""
     global _missing_mcp_warned
-    tenant_id, kind = tenant_identity(chat_id)
+    tenant_id, _ = tenant_identity(chat_id)
+    kind, _ = tenant_target(chat_id)
     if kind != "main":
         return {}
-    script = Path(os.environ.get("BRIDGE_ISOLATED_MCP_DIR", "/opt/telegram-ai/mcp")) / "codex_send_telegram_file_mcp.py"
+    directory = Path(os.environ.get("BRIDGE_ISOLATED_MCP_DIR", "/opt/telegram-ai/mcp"))
+    script = directory / "codex_send_telegram_file_mcp.py"
+    servers = {}
+    exchange = ensure_tenant(chat_id)["exchange"]
     if not script.is_file():
         if not _missing_mcp_warned:
             print(f"Isolated file MCP unavailable: {script}", file=sys.stderr, flush=True)
             _missing_mcp_warned = True
-        return {}
-    exchange = ensure_tenant(tenant_id, "main")["exchange"]
-    return {"send-telegram-file": {"command": "/usr/bin/python3", "args": [str(script)],
-                                   "env": {"CHAT_ID": tenant_id, "TENANT_EXCHANGE_DIR": exchange}}}
+    else:
+        servers["send-telegram-file"] = {"command": "/usr/bin/python3", "args": [str(script)],
+                                          "env": {"CHAT_ID": tenant_id, "TENANT_EXCHANGE_DIR": exchange}}
+    from delegate_to_claude_mcp import claude_bridge_dir
+    delegate_script = directory / "delegate_to_claude_exchange_mcp.py"
+    if delegate_script.is_file() and claude_bridge_dir() is not None:
+        servers["delegate-to-claude"] = {"command": "/usr/bin/python3", "args": [str(delegate_script)],
+                                          "env": {"CHAT_ID": tenant_id, "TENANT_EXCHANGE_DIR": exchange},
+                                          "tool_timeout_sec": 1900}
+    return servers
 
 
 def isolated_mcp_overrides(chat_id):
@@ -175,6 +204,8 @@ def isolated_mcp_overrides(chat_id):
             overrides.append(f"mcp_servers.{name}.{key}={json.dumps(server[key])}")
         for key, value in server["env"].items():
             overrides.append(f"mcp_servers.{name}.env.{key}={json.dumps(value)}")
+        if "tool_timeout_sec" in server:
+            overrides.append(f"mcp_servers.{name}.tool_timeout_sec={server['tool_timeout_sec']}")
     return tuple(overrides)
 
 
@@ -216,21 +247,23 @@ def stage_tenant_control(chat_id, template, file_send_section=None):
     directory = ensure_tenant_control(chat_id, template, file_send_section)
     info = ensure_tenant(chat_id)
     exchange = Path(info["exchange"])
-    for name in ("persona.md", "mcp.json"):
-        atomic_control_write(exchange / name, (directory / name).read_bytes(), 0o644)
+    suffix = ".delegate" if tenant_identity(chat_id)[1] == "delegate" else ""
+    for stem, extension in (("persona", "md"), ("mcp", "json")):
+        name = f"{stem}.{extension}"
+        atomic_control_write(exchange / f"{stem}{suffix}.{extension}", (directory / name).read_bytes(), 0o644)
     return info
 
 
 def assert_empty_mcp(chat_id, kind, cwd="workspace"):
     """Compare effective Codex MCP configuration with the bridge allowlist."""
-    state_key = f"delegate:{chat_id}" if kind == "delegate" else chat_id
+    state_key = chat_id
     overrides = isolated_mcp_overrides(state_key)
     try:
         def listed(extra):
             args = ["mcp", "list", "--json"]
             for override in extra:
                 args.extend(("-c", override))
-            argv = tenant_run_argv(chat_id, kind, cwd=cwd, command="codex", args=args)
+            argv = tenant_run_argv(state_key, kind, cwd=cwd, command="codex", args=args)
             result = subprocess.run(argv, capture_output=True, text=True, timeout=35,
                                     cwd="/", env={"PATH": "/usr/bin:/bin"})
             if result.returncode:
@@ -260,7 +293,8 @@ def assert_empty_mcp(chat_id, kind, cwd="workspace"):
                     or transport.get("command") != server["command"]
                     or transport.get("args") != server["args"]
                     or transport.get("env") != server["env"]
-                    or transport.get("env_vars") != [] or transport.get("cwd") is not None):
+                    or transport.get("env_vars") != [] or transport.get("cwd") is not None
+                    or entry.get("tool_timeout_sec") != server.get("tool_timeout_sec")):
                 raise ValueError("tenant MCP command differs from bridge allowlist")
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         raise TenantUnavailable(f"tenant MCP preflight: {exc}") from exc

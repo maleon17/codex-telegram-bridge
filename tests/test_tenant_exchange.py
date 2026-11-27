@@ -73,7 +73,11 @@ class TenantExchangeTests(unittest.TestCase):
         for body in (b"{broken", b"x" * (exchange_io.REQUEST_MAX_BYTES + 1),
                      ('{"path":' + json.dumps(str(self.good)) + ',"path":"other"}').encode()):
             self.assertFalse(self.request(body)["ok"])
-        self.assertFalse(self.request({"path": str(self.good)}, "bad.json")["ok"])
+        foreign = self.exchange / "queue" / "bad.json"
+        foreign.write_text(json.dumps({"path": str(self.good)}))
+        exchange_io.process_tenant_queue(2, str(self.exchange), self.send, 32)
+        self.assertTrue(foreign.exists())
+        self.assertFalse((self.exchange / "result" / foreign.name).exists())
         self.assertEqual(self.calls, [])
         for create in (lambda p: os.mkfifo(p), lambda p: p.symlink_to(outside)):
             name = f"{uuid.uuid4()}.json"
