@@ -79,6 +79,8 @@ class TenantDelegateExchangeTests(unittest.TestCase):
             self.assertEqual(owner_argv[4:8], ["--kind", "delegate", "--product", "bridge"])
             self.assertIn("mcp_servers.delegate-to-claude.tool_timeout_sec=1900",
                           isolation.isolated_mcp_overrides("delegate:2"))
+            # codex_apps (built-in ChatGPT connectors server) loads with any ChatGPT login and is not allowlisted
+            self.assertIn("features.apps=false", isolation.isolated_mcp_overrides("delegate:2"))
             isolation.stage_tenant_control("2", "main persona")
             isolation.stage_tenant_control("delegate:2", "delegate persona")
             self.assertEqual((self.exchange / "persona.md").read_text(), "main persona")

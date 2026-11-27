@@ -198,7 +198,9 @@ def isolated_mcp_servers(chat_id):
 
 
 def isolated_mcp_overrides(chat_id):
-    overrides = ["mcp_servers={}"]
+    # "apps" is the built-in ChatGPT connectors MCP server (codex_apps): it appears
+    # with any ChatGPT login and is not part of the bridge allowlist, so turn it off.
+    overrides = ["mcp_servers={}", "features.apps=false"]
     for name, server in isolated_mcp_servers(chat_id).items():
         for key in ("command", "args"):
             overrides.append(f"mcp_servers.{name}.{key}={json.dumps(server[key])}")
