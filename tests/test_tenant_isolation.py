@@ -31,7 +31,9 @@ class TenantIsolationTests(unittest.TestCase):
             "HOME": str(self.root), "TELEGRAM_BOT_TOKEN": "000000:test", "OWNER_ID": "1",
             "CODEX_BOT_STATE_FILE": str(self.root / "state.json"),
             "CODEX_BOT_ACCOUNTS_DIR": str(self.root / "accounts"),
-            "BRIDGE_TENANT_CONTROL_DIR": str(self.control), "TELEGRAM_API_URL": "",
+            "BRIDGE_TENANT_CONTROL_DIR": str(self.control),
+            # Hermetic: the default MCP directory exists on hosts that installed the isolation module.
+            "BRIDGE_ISOLATED_MCP_DIR": str(self.root / "no-mcp"), "TELEGRAM_API_URL": "",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
