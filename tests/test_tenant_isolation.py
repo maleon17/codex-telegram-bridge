@@ -96,7 +96,9 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.exchange / "persona.md").stat().st_mode), 0o644)
         params = self.bot._thread_params(runtime)
         self.assertEqual(params["cwd"], str(self.home / "workspace"))
-        self.assertEqual(params["developerInstructions"], isolation.with_isolation_note(persona.read_text()))
+        self.assertIn(isolation.with_isolation_note(persona.read_text()).strip(),
+                      params["developerInstructions"])
+        self.assertEqual(params["developerInstructions"].count(self.bot.SESSION_TITLE_INSTRUCTIONS), 1)
         self.assertNotIn(isolation.ISOLATION_NOTE, persona.read_text())
         delegate = self.bot.get_delegate_tenant(2)
         argv = self.bot.get_app_server(delegate).launch_factory(command)
@@ -106,8 +108,9 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertTrue((self.exchange / "mcp.delegate.json").exists())
         self.assertEqual(self.bot.tenant_codex_home(2, delegate.state_key), self.home / ".codex-delegate")
         delegate_params = self.bot._thread_params(delegate)
-        self.assertEqual(delegate_params["developerInstructions"],
-                         isolation.with_isolation_note((self.control / "2" / "delegate" / "persona.md").read_text()))
+        self.assertIn(isolation.with_isolation_note(
+            (self.control / "2" / "delegate" / "persona.md").read_text()).strip(),
+            delegate_params["developerInstructions"])
         self.assertEqual(delegate_params["cwd"], str(self.home / "workspace"))
         class DelegateClient:
             def request(self, method, params=None, timeout=None):
@@ -260,7 +263,7 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertEqual(calls, ["thread/list", "account/read"])
         self.assertFalse((self.home / ".codex-bridge").exists())
 
-    def test_status_refreshes_account_through_tenant_app_server(self):
+    def test_non_session_commands_remain_closed(self):
         self._on()
         calls, sent = [], []
         class Client:
@@ -272,10 +275,10 @@ class TenantIsolationTests(unittest.TestCase):
         with patch.object(self.bot, "get_app_server", return_value=Client()), \
                 patch.object(self.bot, "selected_model"), \
                 patch.object(self.bot, "send_plain", side_effect=lambda chat, text: sent.append(text)):
-            self.bot.handle_command(2, "/status")
-        self.assertEqual(calls, ["start", "account/read"])
-        self.assertIn("ready", self.bot.chat_state(2)["account_status"])
-        self.assertTrue(sent)
+            for cmd in ("account", "status", "usage", "model", "effort", "resume", "compact"):
+                self.assertTrue(self.bot.handle_command(2, "/" + cmd))
+        self.assertEqual(calls, [])
+        self.assertEqual(len(sent), 7)
 
 
 if __name__ == "__main__":

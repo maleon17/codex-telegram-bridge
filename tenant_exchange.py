@@ -13,6 +13,7 @@ import uuid
 REQUEST_MAX_BYTES = 64 * 1024
 REQUESTS_PER_TENANT_PASS = 4
 UUID_JSON = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.json$")
+RENAME_JSON = re.compile(r"^rename-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.json$")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 WALK_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -181,6 +182,47 @@ def _write_result(result_fd, name, ok, message):
             os.unlink(temporary, dir_fd=result_fd)
         except FileNotFoundError:
             pass
+
+
+def process_tenant_title_queue(exchange, expected_uid, rename):
+    """Handle title requests under the bound tenant's exchange; request cannot select a chat or thread."""
+    queue_fd = open_exchange_dir(exchange, "queue")
+    try:
+        result_fd = open_exchange_dir(exchange, "result")
+        try:
+            with os.scandir(queue_fd) as entries:
+                names = [entry.name for entry in entries if RENAME_JSON.fullmatch(entry.name)]
+            for name in names[:REQUESTS_PER_TENANT_PASS]:
+                ok, message = False, "Запрос отклонён."
+                try:
+                    fd = os.open(name, FILE_FLAGS, dir_fd=queue_fd)
+                    try:
+                        info = os.fstat(fd)
+                        if (not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid
+                                or not info.st_mode & stat.S_IRGRP or info.st_size > REQUEST_MAX_BYTES):
+                            raise ExchangeRefusal("Недоступный запрос переименования.")
+                        with os.fdopen(fd, "rb", closefd=False) as handle:
+                            raw = handle.read(REQUEST_MAX_BYTES + 1)
+                    finally:
+                        os.close(fd)
+                    if len(raw) > REQUEST_MAX_BYTES:
+                        raise ExchangeRefusal("Слишком большой запрос переименования.")
+                    request = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+                    if not isinstance(request, dict) or set(request) != {"title"}:
+                        raise ExchangeRefusal("Допустим только title.")
+                    ok, message = rename(request["title"])
+                except (OSError, ValueError, UnicodeError) as exc:
+                    message = str(exc) if isinstance(exc, ExchangeRefusal) else "Некорректный запрос переименования."
+                finally:
+                    try:
+                        os.unlink(name, dir_fd=queue_fd)
+                    except FileNotFoundError:
+                        pass
+                _write_result(result_fd, name, ok, message)
+        finally:
+            os.close(result_fd)
+    finally:
+        os.close(queue_fd)
 
 
 def process_tenant_queue(chat_id, exchange, send_document, max_bytes):

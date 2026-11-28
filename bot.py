@@ -37,7 +37,8 @@ from isolation import (TenantUnavailable, assert_empty_mcp, with_isolation_note,
                        isolated_mcp_servers, isolated_mcp_overrides, stage_tenant_control, tenant_control_dir,
                        tenant_isolated, tenant_run_argv, tenant_target, workspace_for_state, workspace_relative)
 from tenant_exchange import (ExchangeRefusal, open_absolute_file, process_tenant_queue,
-                             receive_inbox_file)
+                             process_tenant_title_queue, receive_inbox_file, RENAME_JSON)
+from codex_rename_session_mcp import validate_title
 from tenant_delegate_exchange import process_tenant_delegate_queue
 
 
@@ -462,8 +463,12 @@ def get_tenant(chat_id):
 def _isolated_file_send_watcher_loop(chat_id):
     while True:
         try:
-            process_tenant_queue(chat_id, ensure_tenant(chat_id, "main")["exchange"],
+            info = ensure_tenant(chat_id, "main")
+            process_tenant_queue(chat_id, info["exchange"],
                                  send_document, FILE_SEND_MAX_BYTES)
+            if "rename-session" in isolated_mcp_servers(chat_id):
+                process_tenant_title_queue(info["exchange"], int(info["uid"]),
+                                           lambda title: rename_current_session(get_tenant(chat_id), title))
         except Exception as exc:
             log(f"tenant={chat_id} isolated file-send watcher: {type(exc).__name__}")
         time.sleep(1)
@@ -676,6 +681,9 @@ def _ensure_tenant_mcp_config(tenant_dir, chat_id):
         )
     _ensure_tenant_mcp_server(
         tenant_dir, chat_id, "send-telegram-file", "send_telegram_file_mcp.py",
+    )
+    _ensure_tenant_mcp_server(
+        tenant_dir, chat_id, "rename-session", "codex_rename_session_mcp.py",
     )
 
 
@@ -1471,7 +1479,13 @@ def _save_state_locked():
 
 
 def save_thread_id(chat_id, thread_id):
-    update_state(chat_id, thread_id=thread_id)
+    with state_lock:
+        changed = chat_state(chat_id).get("thread_id") != thread_id
+    values = {"thread_id": thread_id}
+    if changed:
+        values.update(title_thread_id=None, thread_title="", title_turn_thread_id=thread_id,
+                      title_turn_count=0)
+    update_state(chat_id, **values)
 
 
 def compact(value, limit=1000):
@@ -2122,6 +2136,8 @@ def process_file_send_queue():
     """Send approved outbox files requested through tenant MCP processes."""
     FILE_SEND_QUEUE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     for request_path in sorted(FILE_SEND_QUEUE_DIR.glob("*.json")):
+        if RENAME_JSON.fullmatch(request_path.name):
+            continue
         current_language.set("ru")
         request_id = request_path.stem
         try:
@@ -2185,7 +2201,49 @@ def file_send_queue_watcher():
     """Keep MCP file delivery responsive while Telegram is long-polling."""
     while True:
         process_file_send_queue()
+        process_rename_session_queue()
         time.sleep(1)
+
+
+def process_rename_session_queue():
+    """Handle ordinary tenants' title requests in the existing file-send exchange."""
+    FILE_SEND_QUEUE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for path in sorted(FILE_SEND_QUEUE_DIR.glob("rename-*.json")):
+        if not RENAME_JSON.fullmatch(path.name):
+            continue
+        ok, message = False, "Некорректный запрос переименования."
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > 64 * 1024:
+                    raise ValueError("Недоступный запрос переименования.")
+                with os.fdopen(fd, "rb", closefd=False) as handle:
+                    raw = handle.read(64 * 1024 + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > 64 * 1024:
+                raise ValueError("Слишком большой запрос переименования.")
+            request = json.loads(raw)
+            if not isinstance(request, dict) or set(request) != {"title", "chat_id"}:
+                raise ValueError("Допустимы только title и chat_id.")
+            chat_id = request["chat_id"]
+            if (not isinstance(chat_id, int) or isinstance(chat_id, bool)
+                    or str(chat_id) not in load_whitelist() or tenant_isolated(chat_id)):
+                raise ValueError("Чат недоступен.")
+            runtime = get_tenant(chat_id)
+            delegate = tenants_delegate.get(chat_id)
+            if delegate is not None and delegate.busy:
+                runtime = delegate
+            ok, message = rename_current_session(runtime, request["title"])
+        except (OSError, ValueError, UnicodeError) as exc:
+            message = str(exc)
+        finally:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        _write_file_send_result(path.stem, ok, message)
 
 
 def edit_rich(chat_id, message_id, markdown_text):
@@ -2428,13 +2486,19 @@ class TurnView:
             answer = t("turn_codex_error", error=error)
         else:
             answer = final_text or t("turn_no_answer")
-        if self.usage is not None:
-            answer += t("turn_tokens_line", usage=format_usage(self.usage))
-        if self.context_notice:
-            answer += f"\n\n{self.context_notice}"
         with state_lock:
             thread_id = chat_state(self.state_key).get("thread_id")
             prior_thread_id = chat_state(self.state_key).get("pending_delegator_session_id")
+            state_title = chat_state(self.state_key)
+            title = (state_title.get("thread_title") or "") if state_title.get("title_thread_id") == thread_id else ""
+        if self.usage is not None:
+            suffix = ""
+            if thread_id and prior_thread_id is None:
+                suffix = t("turn_session_suffix", thread_id=thread_id[:8],
+                           title=(" «" + compact(title, 40) + "»") if title else "")
+            answer += t("turn_tokens_line", usage=format_usage(self.usage), session=suffix)
+        if self.context_notice:
+            answer += f"\n\n{self.context_notice}"
         # Delegation-only footer, not a per-message one (per the owner
         # directly): only present when this turn was actually kicked off
         # via external_request_watcher(), and one-shot -- cleared right
@@ -2639,6 +2703,9 @@ def _usage_for_renderer(token_usage):
 
 def handle_app_notification(runtime, method, params):
     _set_chat_language(runtime.chat_id)
+    if method == "thread/name/updated":
+        _cache_thread_title(runtime.state_key, params.get("threadId"), params.get("threadName"))
+        return
     if method == "account/rateLimits/updated":
         update = params.get("rateLimits") or {}
         with process_lock:
@@ -2743,6 +2810,16 @@ def handle_app_notification(runtime, method, params):
     view.flush(force=force)
 
 
+SESSION_TITLE_INSTRUCTIONS = (
+    "После первого содержательного обмена задай название сессии через rename_session "
+    "(3–7 слов, суть темы). Если тема существенно сменилась или название устарело "
+    "(например, «приветствие»), обнови его. Не упоминай это пользователю."
+)
+# The periodic reminder is a separate input item of the user turn, never part of the developer instructions: those
+# are bound at thread start/resume, and changing them would force a resume on every turn and break the prompt cache.
+SESSION_TITLE_NOTE = "<bridge-note>Проверь название сессии и обнови, если тема изменилась или названия нет.</bridge-note>"
+
+
 def _thread_params(runtime, thread_id=None):
     with state_lock:
         snapshot = dict(chat_state(runtime.state_key))
@@ -2755,10 +2832,15 @@ def _thread_params(runtime, thread_id=None):
         params["model"] = snapshot["model"]
     if thread_id:
         params["threadId"] = thread_id
+    instructions = ""
     if tenant_isolated(runtime.chat_id):
         persona_text = _persona_path(runtime.state_key).read_text(encoding="utf-8")
-        params["developerInstructions"] = with_isolation_note(
+        instructions = with_isolation_note(
             persona_text, ensure_tenant(runtime.state_key).get("role", "member"))
+    instructions = instructions.rstrip()
+    if SESSION_TITLE_INSTRUCTIONS not in instructions:
+        instructions += "\n\n" + SESSION_TITLE_INSTRUCTIONS
+    params["developerInstructions"] = instructions.strip()
     return params
 
 
@@ -2931,6 +3013,20 @@ def ensure_thread(runtime, client, requested_thread_id):
     return thread_id
 
 
+def _turn_input(inputs, title_turn):
+    """The user's own items, plus the title reminder as a separate sentinel item on turn 2 and every 10th."""
+    if title_turn == 2 or title_turn % 10 == 0:
+        return list(inputs) + [{"type": "text", "text": SESSION_TITLE_NOTE}]
+    return inputs
+
+
+def next_title_turn(runtime, thread_id):
+    with state_lock:
+        snapshot = chat_state(runtime.state_key)
+        count = snapshot.get("title_turn_count", 0) if snapshot.get("title_turn_thread_id") == thread_id else 0
+        return count + 1
+
+
 def sandbox_policy(name, workspace):
     if name == "read-only":
         return {"type": "readOnly", "networkAccess": False}
@@ -2973,7 +3069,13 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
             if runtime.cancel_requested:
                 view.deliver(stopped=True)
                 return
+        title_turn = next_title_turn(runtime, thread_id)
         server_thread_id = ensure_thread(runtime, client, thread_id)
+        with state_lock:
+            if chat_state(runtime.state_key).get("title_turn_thread_id") != server_thread_id:
+                title_turn = 1
+        update_state(runtime.state_key, title_turn_thread_id=server_thread_id,
+                     title_turn_count=title_turn)
         with state_lock:
             snapshot = dict(chat_state(runtime.state_key))
         with process_lock:
@@ -2992,7 +3094,7 @@ def run_turn(runtime, inputs, thread_id, media_paths=None, progress_msg_id=None)
                 return
         params = {
             "threadId": server_thread_id,
-            "input": inputs,
+            "input": _turn_input(inputs, title_turn),
             "cwd": runtime_workspace(runtime, snapshot),
             "approvalPolicy": "never",
             "sandboxPolicy": sandbox_policy(
@@ -3135,6 +3237,11 @@ def session_files(runtime_or_chat_id=OWNER_ID, state_key=None):
             cursor = result.get("nextCursor")
             if not cursor:
                 break
+        current = chat_state(runtime.state_key).get("thread_id")
+        for row in rows:
+            if row.get("id") == current and row.get("name"):
+                _cache_thread_title(runtime.state_key, current, row["name"])
+                break
         return rows
     codex_home = tenant_codex_home(chat_id, state_key=state_key)
     root = (codex_home or default_codex_home()) / "sessions"
@@ -3143,8 +3250,8 @@ def session_files(runtime_or_chat_id=OWNER_ID, state_key=None):
 
 def session_info(path):
     if isinstance(path, dict):
-        return str(path.get("id") or ""), compact(str(path.get("preview") or path.get("name") or ""), 55)
-    sid, preview = path.stem, ""
+        return str(path.get("id") or ""), compact(str(path.get("name") or path.get("preview") or ""), 50)
+    sid, first, fallback = path.stem, "", ""
     try:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -3154,13 +3261,114 @@ def session_info(path):
                     sid = payload.get("id", sid)
                 elif obj.get("type") == "response_item" and payload.get("role") == "user":
                     texts = [part.get("text", "") for part in payload.get("content", [])
-                             if part.get("type") == "input_text"]
+                             if part.get("type") == "input_text" and not part.get("text", "").startswith("<bridge-note>")]
                     candidate = " ".join(texts).strip()
-                    if candidate and not candidate.startswith("<recommended_plugins>"):
-                        preview = compact(candidate, 55)
+                    if _session_user_text(candidate):
+                        fallback = fallback or candidate
+                        if not first and len(candidate) >= 12 and not _session_greeting(candidate):
+                            first = candidate
     except Exception:
         pass
-    return sid, preview
+    return sid, compact(first or fallback, 50)
+
+
+def _session_user_text(value):
+    return bool(value and value.strip() and not value.lstrip().startswith((
+        "<", "# AGENTS.md instructions",
+    )))
+
+
+def _session_greeting(value):
+    return value.strip().lower().strip("!.,? ") in {
+        "привет", "здравствуй", "здравствуйте", "добрый день", "доброе утро",
+        "добрый вечер", "hi", "hello", "hey", "сәлем", "вітаю", "привіт",
+    }
+
+
+def _thread_user_messages(thread):
+    messages = []
+    for turn in thread.get("turns") or []:
+        for item in turn.get("items") or []:
+            if item.get("type") not in ("userMessage", "user_message"):
+                continue
+            content = item.get("content") or item.get("text") or ""
+            if isinstance(content, list):
+                content = " ".join(part.get("text", "") for part in content if isinstance(part, dict)
+                                   and part.get("type") in ("text", "input_text")
+                                   and not part.get("text", "").startswith("<bridge-note>"))
+            if isinstance(content, str) and _session_user_text(content):
+                messages.append(" ".join(content.split()))
+    return messages
+
+
+def session_display(runtime, row):
+    sid, description = session_info(row)
+    last = ""
+    if isinstance(row, dict):
+        try:
+            result = get_app_server(runtime).request(
+                "thread/read", {"threadId": sid, "includeTurns": True}, timeout=30) or {}
+            thread = result.get("thread") or {}
+            messages = _thread_user_messages(thread)
+            if not row.get("name") and thread.get("name"):
+                description = thread["name"]
+            elif not row.get("name") and messages:
+                description = next((text for text in messages if len(text) >= 12
+                                    and not _session_greeting(text)), messages[0])
+            last = messages[-1] if messages else ""
+            if sid == chat_state(runtime.state_key).get("thread_id"):
+                _cache_thread_title(runtime.state_key, sid, row.get("name") or thread.get("name"))
+        except Exception:
+            pass
+    else:
+        try:
+            with row.open(encoding="utf-8") as handle:
+                for line in handle:
+                    obj = json.loads(line)
+                    payload = obj.get("payload") or {}
+                    if obj.get("type") == "response_item" and payload.get("role") == "user":
+                        text = " ".join(part.get("text", "") for part in payload.get("content", [])
+                                        if part.get("type") == "input_text"
+                                        and not part.get("text", "").startswith("<bridge-note>")).strip()
+                        if _session_user_text(text):
+                            last = " ".join(text.split())
+        except Exception:
+            pass
+    if not isinstance(row, dict):
+        with state_lock:
+            current = chat_state(runtime.state_key)
+            if current.get("thread_id") == sid and current.get("title_thread_id") == sid and current.get("thread_title"):
+                description = current["thread_title"]
+    description = " ".join(description.split())
+    tail = compact(last, 35) if last and last != description else ""
+    description = compact(description, 50)
+    return sid, description + (" ↳ " + tail if tail else "")
+
+
+def _cache_thread_title(state_key, thread_id, title):
+    if not isinstance(title, str):
+        return
+    with state_lock:
+        if chat_state(state_key).get("thread_id") != thread_id:
+            return
+    update_state(state_key, title_thread_id=thread_id, thread_title=title)
+
+
+def rename_current_session(runtime, raw_title):
+    try:
+        title = validate_title(raw_title)
+    except ValueError as exc:
+        return False, str(exc)
+    with state_lock:
+        thread_id = chat_state(runtime.state_key).get("thread_id")
+    if not thread_id:
+        return False, "У этого чата пока нет текущей сессии."
+    try:
+        get_app_server(runtime).request("thread/name/set", {"threadId": thread_id, "name": title}, timeout=30)
+    except Exception:
+        return False, "Не удалось изменить название сессии."
+    _cache_thread_title(runtime.state_key, thread_id, title)
+    return True, f"Название сессии изменено: {title}"
 
 
 def session_message_count(runtime_or_chat_id, thread_id, state_key=None):
@@ -3175,11 +3383,25 @@ def session_message_count(runtime_or_chat_id, thread_id, state_key=None):
             result = get_app_server(runtime).request(
                 "thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=30,
             ) or {}
-            turns = (result.get("thread") or {}).get("turns")
+            thread = result.get("thread") or {}
+            _cache_thread_title(runtime.state_key, thread_id, thread.get("name"))
+            turns = thread.get("turns")
             return len(turns) if isinstance(turns, list) else None
         except Exception:
             return None
     for path in session_files(runtime_or_chat_id, state_key=state_key):
+        if isinstance(path, dict):
+            if path.get("id") != thread_id:
+                continue
+            try:
+                result = get_app_server(runtime_or_chat_id).request(
+                    "thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=30) or {}
+                thread = result.get("thread") or {}
+                _cache_thread_title(runtime_or_chat_id.state_key, thread_id, thread.get("name"))
+                turns = thread.get("turns")
+                return len(turns) if isinstance(turns, list) else None
+            except Exception:
+                return None
         sid, _ = session_info(path)
         if sid != thread_id:
             continue
@@ -4254,7 +4476,10 @@ def handle_command(chat_id, command, runtime=None):
     raw_cmd, _, arg = command.partition(" ")
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
-    if tenant_isolated(chat_id) and cmd in {"account", "status", "usage", "model", "effort", "sessions", "resume", "compact"}:
+    if tenant_isolated(chat_id) and cmd in {"account", "status", "usage", "model", "effort", "resume", "compact"}:
+        send_plain(chat_id, t("isolated_command_closed"))
+        return True
+    if tenant_isolated(chat_id) and cmd == "sessions":
         get_app_server(runtime).start_if_needed()
     if cmd in ("start", "help"):
         send_plain(chat_id, t('help_intro'))
@@ -4295,14 +4520,15 @@ def handle_command(chat_id, command, runtime=None):
             send_plain(chat_id, t('new_previous_turn_finishing'))
             return True
         cancel_pending_batch(runtime)
-        update_state(state_key, thread_id=None, last_usage=None, session_usage=None, context_window=None)
+        save_thread_id(state_key, None)
+        update_state(state_key, last_usage=None, session_usage=None, context_window=None)
         send_plain(chat_id, t('new_thread_reset'))
         return True
     if cmd == "sessions":
         current = chat_state(state_key).get("thread_id")
         rows = []
         for path in session_files(runtime)[:10]:
-            sid, preview = session_info(path)
+            sid, preview = session_display(runtime, path)
             rows.append(f"{sid[:8]}{t('sessions_current_marker') if sid == current else ''}  {preview}")
         send_plain(chat_id, t("sessions_list", rows="\n".join(rows) or t("sessions_none")))
         return True

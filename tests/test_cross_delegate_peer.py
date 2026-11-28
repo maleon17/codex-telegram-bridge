@@ -179,7 +179,7 @@ class TenantSeedingTests(unittest.TestCase):
                     patch.object(bot.subprocess, "run") as run:
                 with patch.object(bot, "claude_bridge_dir", return_value=None):
                     bot._ensure_tenant_mcp_config(tenant, 5)
-                self.assertEqual(seeded, ["send-telegram-file"])
+                self.assertEqual(seeded, ["send-telegram-file", "rename-session"])
                 run.assert_not_called()  # nothing of ours to withdraw
 
                 # A server this bot seeded earlier is withdrawn once the peer is gone...
@@ -205,7 +205,7 @@ class TenantSeedingTests(unittest.TestCase):
                 seeded.clear()
                 with patch.object(bot, "claude_bridge_dir", return_value=root):
                     bot._ensure_tenant_mcp_config(tenant, 5)
-                self.assertEqual(seeded, ["delegate-to-claude", "send-telegram-file"])
+                self.assertEqual(seeded, ["delegate-to-claude", "send-telegram-file", "rename-session"])
 
 
 if __name__ == "__main__":

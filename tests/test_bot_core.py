@@ -406,7 +406,8 @@ class RuntimeIsolationTests(unittest.TestCase):
                 owner_session.write_text("", encoding="utf-8")
                 delegate_session.write_text("", encoding="utf-8")
                 self.assertEqual(bot.session_files(bot.OWNER_ID), [owner_session])
-                self.assertEqual(bot.session_files(runtime), [delegate_session])
+                with patch.object(bot, "get_app_server", side_effect=RuntimeError("offline")):
+                    self.assertEqual(bot.session_files(runtime), [delegate_session])
 
                 client = bot.get_app_server(runtime)
                 self.assertEqual(Path(client.env["CODEX_HOME"]), delegate_home)

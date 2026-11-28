@@ -24,6 +24,7 @@ Unlike wrappers that start a fresh `codex exec` for every message, each user get
 ## What you get
 
 - **Real sessions** — `/new`, `/sessions`, `/resume`; threads survive restarts.
+- **Readable session titles** — `/sessions` shows thread names and recent prompts; answers show the session number beside token usage. Codex can update the current title through `rename_session` when the file exchange MCP is installed.
 - **Watch it work** — a live progress card while Codex works, then the answer as a normal message.
 - **Steer mid-turn** — a message sent while Codex is busy is added to the running turn, not queued.
 - **Stop and compact** — `/stop` interrupts the turn for real, `/compact` shrinks a long thread.

@@ -188,6 +188,10 @@ def isolated_mcp_servers(chat_id):
     else:
         servers["send-telegram-file"] = {"command": "/usr/bin/python3", "args": [str(script)],
                                           "env": {"CHAT_ID": tenant_id, "TENANT_EXCHANGE_DIR": exchange}}
+        rename_script = directory / "codex_rename_session_mcp.py"
+        if rename_script.is_file():
+            servers["rename-session"] = {"command": "/usr/bin/python3", "args": [str(rename_script)],
+                                          "env": {"CHAT_ID": tenant_id, "TENANT_EXCHANGE_DIR": exchange}}
     from delegate_to_claude_mcp import claude_bridge_dir
     delegate_script = directory / "delegate_to_claude_exchange_mcp.py"
     if delegate_script.is_file() and claude_bridge_dir() is not None:
