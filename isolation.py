@@ -224,11 +224,24 @@ ISOLATION_NOTE = """
 """.strip()
 
 
-def with_isolation_note(text):
-    """Persona text as the isolated agent sees it: the stored persona plus the fixed runtime note."""
-    if ISOLATION_NOTE in text:
+ADMIN_ISOLATION_NOTE = """
+## Среда выполнения
+
+Ты работаешь как администратор сервера под отдельным пользователем с `sudo` без пароля.
+Серверные операции (перезапуск служб, чтение журналов, установка пакетов) выполняй через
+`sudo` осознанно: сначала выясни, что именно изменится, и не делай разрушающих действий
+без явной просьбы пользователя. Домашняя папка основного пользователя сервера и файлы
+других тенантов закрыты обычными правами: заходи туда через `sudo` и только когда этого
+требует задача.
+""".strip()
+
+
+def with_isolation_note(text, role="member"):
+    """Persona text as the isolated agent sees it: the stored persona plus the fixed runtime note for its role."""
+    note = ADMIN_ISOLATION_NOTE if role == "admin" else ISOLATION_NOTE
+    if note in text:
         return text
-    return text.rstrip() + "\n\n" + ISOLATION_NOTE + "\n"
+    return text.rstrip() + "\n\n" + note + "\n"
 
 
 def ensure_tenant_control(chat_id, template, file_send_section=None):
@@ -275,7 +288,7 @@ def stage_tenant_control(chat_id, template, file_send_section=None):
         data = (directory / name).read_bytes()
         if stem == "persona":
             # The fixed runtime note is added to the staged copy only, never to the stored persona.
-            data = with_isolation_note(data.decode("utf-8")).encode("utf-8")
+            data = with_isolation_note(data.decode("utf-8"), info.get("role", "member")).encode("utf-8")
         atomic_control_write(exchange / f"{stem}{suffix}.{extension}", data, 0o644)
     return info
 

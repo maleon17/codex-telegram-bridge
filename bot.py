@@ -2757,7 +2757,8 @@ def _thread_params(runtime, thread_id=None):
         params["threadId"] = thread_id
     if tenant_isolated(runtime.chat_id):
         persona_text = _persona_path(runtime.state_key).read_text(encoding="utf-8")
-        params["developerInstructions"] = with_isolation_note(persona_text)
+        params["developerInstructions"] = with_isolation_note(
+            persona_text, ensure_tenant(runtime.state_key).get("role", "member"))
     return params
 
 

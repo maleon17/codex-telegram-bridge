@@ -93,6 +93,16 @@ class TenantDelegateExchangeTests(unittest.TestCase):
                              isolation.with_isolation_note("delegate persona"))
             self.assertEqual(isolation.with_isolation_note(isolation.with_isolation_note("x")),
                              isolation.with_isolation_note("x"))
+            # administrators get the sudo-aware note, members the restricted one
+            member, admin = isolation.with_isolation_note("p"), isolation.with_isolation_note("p", "admin")
+            self.assertIn(isolation.ISOLATION_NOTE, member)
+            self.assertNotIn(isolation.ADMIN_ISOLATION_NOTE, member)
+            self.assertIn(isolation.ADMIN_ISOLATION_NOTE, admin)
+            self.assertNotIn(isolation.ISOLATION_NOTE, admin)
+            admin_info = dict(info, role="admin")
+            with patch.object(isolation, "ensure_tenant", return_value=admin_info):
+                isolation.stage_tenant_control("2", "main persona")
+            self.assertIn(isolation.ADMIN_ISOLATION_NOTE, (self.exchange / "persona.md").read_text())
             self.assertTrue((self.exchange / "mcp.delegate.json").exists())
             entry = lambda name: {"name": name, "enabled": True,
                                   "transport": {"type": "stdio", **{k: servers[name][k] for k in ("command", "args", "env")},
