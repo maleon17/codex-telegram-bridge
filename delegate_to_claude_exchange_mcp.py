@@ -68,7 +68,7 @@ def _write_request(exchange, request_id, prompt):
         raise ValueError("Запрос больше 64 КБ.")
     directory = _open_dir(exchange, "queue")
     temporary = f".delegate-{uuid.uuid4()}.tmp"
-    name = f"delegate-{request_id}.json"
+    name = f"delegate-claude-{request_id}.json"
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o660, dir_fd=directory)
@@ -118,7 +118,7 @@ def _delegate_request(prompt, wait_seconds=DEFAULT_WAIT_S):
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
         return False, "Отклонено локально: текст задачи должен содержать от 1 до 32000 символов."
     request_id = str(uuid.uuid4())
-    name = f"delegate-{request_id}.json"
+    name = f"delegate-claude-{request_id}.json"
     try:
         _write_request(exchange, request_id, prompt)
     except (OSError, ValueError) as exc:

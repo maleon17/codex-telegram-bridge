@@ -45,7 +45,10 @@ format in telegram-ai-core's README). There is no import-level coupling.
   whitelisted id whose own account is ready, runs it, posts the answer in its
   own chat and writes it where the acceptance said; the tool waits for that
   answer and returns it. The Claude bridge's `delegate-to-codex` is the mirror
-  image: this bot consumes `cross_delegate_queue/`, checks the id against its
+  image. In an isolated tenant's `.exchange/queue/` the direction is part of the
+  request file name (`delegate-claude-<uuid>.json` from this tool,
+  `delegate-codex-<uuid>.json` from the Claude bridge's) and each bridge
+  forwards only its own prefix. This bot consumes `cross_delegate_queue/`, checks the id against its
   current whitelist and requires that account's `account_status` to be
   `ready`, then runs the task in the isolated delegate runtime and writes the
   immediate accept/reject status to `cross_delegate_result/`.

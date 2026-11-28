@@ -47,7 +47,7 @@ class TenantDelegateExchangeTests(unittest.TestCase):
         isolation._cache.clear()
 
     def put(self, body, name=None):
-        name = name or f"delegate-{uuid.uuid4()}.json"
+        name = name or f"delegate-claude-{uuid.uuid4()}.json"
         path = self.exchange / "queue" / name
         path.write_bytes(body if isinstance(body, bytes) else json.dumps(body).encode())
         return name, path
@@ -127,13 +127,22 @@ class TenantDelegateExchangeTests(unittest.TestCase):
                 broker.process_tenant_delegate_queue("2", str(self.exchange))
                 self.assertFalse(self.result(name)["ok"])
                 self.assertFalse(path.exists())
-            name, _ = self.put({"text": "ok"}, "delegate-bad.json")
+            name, _ = self.put({"text": "ok"}, "delegate-claude-bad.json")
             broker.process_tenant_delegate_queue("2", str(self.exchange))
             self.assertFalse(self.result(name)["ok"])
+            # Requests addressed to Codex (written by the Claude bridge's tool) must stay untouched,
+            # otherwise both bridges forward the same file and the task runs twice.
+            other, other_path = self.put({"text": "for codex"}, f"delegate-codex-{uuid.uuid4()}.json")
+            before = list(called)
+            broker.process_tenant_delegate_queue("2", str(self.exchange))
+            self.assertEqual(called, before)
+            self.assertTrue(other_path.exists())
+            self.assertFalse((self.exchange / "result" / other).exists())
+            other_path.unlink()
             outside = self.root / "outside"
             outside.write_text("secret")
             for create in (lambda p: p.symlink_to(outside), lambda p: os.mkfifo(p)):
-                name = f"delegate-{uuid.uuid4()}.json"
+                name = f"delegate-claude-{uuid.uuid4()}.json"
                 create(self.exchange / "queue" / name)
                 broker.process_tenant_delegate_queue("2", str(self.exchange))
                 self.assertFalse(self.result(name)["ok"])
@@ -155,7 +164,7 @@ class TenantDelegateExchangeTests(unittest.TestCase):
             with patch.dict(os.environ, {"TENANT_EXCHANGE_DIR": str(exchange)}):
                 request_id = str(uuid.uuid4())
                 mcp._write_request(str(exchange), request_id, "task")
-                self.assertTrue((exchange / "queue" / f"delegate-{request_id}.json").exists())
+                self.assertTrue((exchange / "queue" / f"delegate-claude-{request_id}.json").exists())
         finally:
             os.chmod(base, 0o755)
 
@@ -204,7 +213,7 @@ class TenantDelegateExchangeTests(unittest.TestCase):
     def test_mcp_request_and_safe_result(self):
         request_id = str(uuid.uuid4())
         mcp._write_request(str(self.exchange), request_id, "hello")
-        name = f"delegate-{request_id}.json"
+        name = f"delegate-claude-{request_id}.json"
         self.assertEqual(json.loads((self.exchange / "queue" / name).read_text()), {"text": "hello"})
         self.assertEqual((self.exchange / "queue" / name).stat().st_mode & 0o777, 0o660)
         (self.exchange / "result" / name).write_text(json.dumps({"done": True, "ok": True, "text": "ok"}))
@@ -241,7 +250,7 @@ class TenantDelegateExchangeTests(unittest.TestCase):
         attachment = self.exchange / "outbox" / "f.txt"
         attachment.write_text("hello")
         file_name = f"{uuid.uuid4()}.json"
-        delegate_name = f"delegate-{uuid.uuid4()}.json"
+        delegate_name = f"delegate-claude-{uuid.uuid4()}.json"
         self.put({"path": str(attachment)}, file_name)
         self.put({"text": "task"}, delegate_name)
         sent = []
