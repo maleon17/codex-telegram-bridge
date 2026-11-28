@@ -51,6 +51,31 @@ class TenantExchangeTests(unittest.TestCase):
         self.assertEqual(self.calls[0][:4], (2, "safe content", "hello", "report.txt"))
         self.assertFalse(Path(self.calls[0][4]).exists())
 
+    def test_tool_makes_private_outbox_file_bridge_readable(self):
+        private = self.exchange / "outbox" / "private.bin"
+        private.write_text("p")
+        private.chmod(0o600)
+        with patch.dict(os.environ, {"TENANT_EXCHANGE_DIR": str(self.exchange)}):
+            mcp._share_with_bridge(str(private))
+        self.assertEqual(stat.S_IMODE(os.stat(private).st_mode), 0o660)
+        # not isolated: untouched; a symlink is never followed
+        other = self.exchange / "outbox" / "other.bin"
+        other.write_text("o")
+        other.chmod(0o600)
+        mcp._share_with_bridge(str(other))
+        self.assertEqual(stat.S_IMODE(os.stat(other).st_mode), 0o600)
+        link = self.exchange / "outbox" / "alias.bin"
+        link.symlink_to(other)
+        with patch.dict(os.environ, {"TENANT_EXCHANGE_DIR": str(self.exchange)}):
+            mcp._share_with_bridge(str(link))
+        self.assertEqual(stat.S_IMODE(os.stat(other).st_mode), 0o600)
+
+    def test_unreadable_file_gets_a_clear_message(self):
+        with patch.object(exchange_io, "_copy_for_send", side_effect=PermissionError):
+            result = self.request({"path": str(self.good)})
+        self.assertFalse(result["ok"])
+        self.assertIn("права 660", result["text"])
+
     def test_outbox_and_request_attacks(self):
         outside = self.root / "outside.txt"
         outside.write_text("secret")

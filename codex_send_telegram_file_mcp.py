@@ -121,6 +121,29 @@ def _write_request(request_id, chat_id, path, caption):
         raise
 
 
+def _share_with_bridge(path):
+    """In an isolated tenant the bridge reads the file as another user (the group of the exchange directory).
+
+    Make the tenant's own regular file group-readable instead of failing later with a vague error. A file that
+    was copied with `cp -p`/`copy2` from a private location keeps its 0600 mode otherwise. Never follows symlinks
+    and touches nothing that is not a regular file owned by this user.
+    """
+    if not os.environ.get("TENANT_EXCHANGE_DIR"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return  # the bridge reports the real problem
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and (info.st_mode & 0o060) != 0o060:
+            os.fchmod(fd, (info.st_mode & 0o7777) | 0o060)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _send_file(path, caption=""):
     raw_chat_id = os.environ.get("CHAT_ID", "")
     try:
@@ -134,6 +157,7 @@ def _send_file(path, caption=""):
     if not isinstance(caption, str):
         return False, "Отклонено локально: подпись должна быть строкой."
 
+    _share_with_bridge(path)
     request_id = str(uuid.uuid4())
     result_path = _directories()[1] / f"{request_id}.json"
     try:

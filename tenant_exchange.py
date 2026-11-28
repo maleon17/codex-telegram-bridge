@@ -224,6 +224,8 @@ def _process_tenant_queue_open(chat_id, exchange, send_document, max_bytes, queu
             message = "Файл отправлен." if ok else "Не удалось отправить файл в Telegram."
         except ExchangeRefusal as exc:
             message = str(exc)
+        except PermissionError:
+            message = "Файл недоступен мосту: он должен принадлежать тебе и быть читаемым для группы (права 660, chmod 660 файл)."
         except Exception:
             message = "Не удалось обработать запрос на отправку файла."
         try:
