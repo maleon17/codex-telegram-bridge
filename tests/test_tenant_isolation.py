@@ -96,7 +96,8 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.exchange / "persona.md").stat().st_mode), 0o644)
         params = self.bot._thread_params(runtime)
         self.assertEqual(params["cwd"], str(self.home / "workspace"))
-        self.assertEqual(params["developerInstructions"], persona.read_text())
+        self.assertEqual(params["developerInstructions"], isolation.with_isolation_note(persona.read_text()))
+        self.assertNotIn(isolation.ISOLATION_NOTE, persona.read_text())
         delegate = self.bot.get_delegate_tenant(2)
         argv = self.bot.get_app_server(delegate).launch_factory(command)
         self.assertEqual(argv[5:8], ["main", "--product", "delegate"])
@@ -106,7 +107,7 @@ class TenantIsolationTests(unittest.TestCase):
         self.assertEqual(self.bot.tenant_codex_home(2, delegate.state_key), self.home / ".codex-delegate")
         delegate_params = self.bot._thread_params(delegate)
         self.assertEqual(delegate_params["developerInstructions"],
-                         (self.control / "2" / "delegate" / "persona.md").read_text())
+                         isolation.with_isolation_note((self.control / "2" / "delegate" / "persona.md").read_text()))
         self.assertEqual(delegate_params["cwd"], str(self.home / "workspace"))
         class DelegateClient:
             def request(self, method, params=None, timeout=None):

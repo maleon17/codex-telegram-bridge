@@ -83,8 +83,16 @@ class TenantDelegateExchangeTests(unittest.TestCase):
             self.assertIn("features.apps=false", isolation.isolated_mcp_overrides("delegate:2"))
             isolation.stage_tenant_control("2", "main persona")
             isolation.stage_tenant_control("delegate:2", "delegate persona")
-            self.assertEqual((self.exchange / "persona.md").read_text(), "main persona")
-            self.assertEqual((self.exchange / "persona.delegate.md").read_text(), "delegate persona")
+            # the staged copy carries the fixed runtime note; the stored persona does not
+            staged = (self.exchange / "persona.md").read_text()
+            self.assertEqual(staged, isolation.with_isolation_note("main persona"))
+            self.assertEqual(staged.count(isolation.ISOLATION_NOTE), 1)
+            self.assertIn("sudo", staged)
+            self.assertEqual((isolation.tenant_control_dir("2") / "persona.md").read_text(), "main persona")
+            self.assertEqual((self.exchange / "persona.delegate.md").read_text(),
+                             isolation.with_isolation_note("delegate persona"))
+            self.assertEqual(isolation.with_isolation_note(isolation.with_isolation_note("x")),
+                             isolation.with_isolation_note("x"))
             self.assertTrue((self.exchange / "mcp.delegate.json").exists())
             entry = lambda name: {"name": name, "enabled": True,
                                   "transport": {"type": "stdio", **{k: servers[name][k] for k in ("command", "args", "env")},

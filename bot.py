@@ -33,7 +33,7 @@ from telegram_actions_link import SERVER_NAME as TELEGRAM_ACTIONS_SERVER, resolv
 from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
 from strings import COMMAND_DESCRIPTIONS, current_language, t
 from tenant_migration import apply_pending_tenant_migration
-from isolation import (TenantUnavailable, assert_empty_mcp, ensure_tenant, ensure_tenant_control,
+from isolation import (TenantUnavailable, assert_empty_mcp, with_isolation_note, ensure_tenant, ensure_tenant_control,
                        isolated_mcp_servers, isolated_mcp_overrides, stage_tenant_control, tenant_control_dir,
                        tenant_isolated, tenant_run_argv, tenant_target, workspace_for_state, workspace_relative)
 from tenant_exchange import (ExchangeRefusal, open_absolute_file, process_tenant_queue,
@@ -2756,7 +2756,8 @@ def _thread_params(runtime, thread_id=None):
     if thread_id:
         params["threadId"] = thread_id
     if tenant_isolated(runtime.chat_id):
-        params["developerInstructions"] = _persona_path(runtime.state_key).read_text(encoding="utf-8")
+        persona_text = _persona_path(runtime.state_key).read_text(encoding="utf-8")
+        params["developerInstructions"] = with_isolation_note(persona_text)
     return params
 
 

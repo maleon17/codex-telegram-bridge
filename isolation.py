@@ -211,6 +211,26 @@ def isolated_mcp_overrides(chat_id):
     return tuple(overrides)
 
 
+ISOLATION_NOTE = """
+## Среда выполнения
+
+Ты работаешь в изолированной среде под отдельным непривилегированным пользователем.
+`sudo`, установка пакетов через `apt`/`dpkg` и любое повышение прав здесь недоступны:
+это штатное ограничение, а не ошибка. Нужные инструменты ставь в пользовательское
+пространство: `pip install --user` или виртуальное окружение (`python3 -m venv`),
+`npm` с префиксом в домашней папке, готовые бинарники в `~/.local/bin`. Если без
+системного пакета не обойтись, не пытайся обойти ограничение, а скажи пользователю,
+что такой пакет должен поставить владелец сервера.
+""".strip()
+
+
+def with_isolation_note(text):
+    """Persona text as the isolated agent sees it: the stored persona plus the fixed runtime note."""
+    if ISOLATION_NOTE in text:
+        return text
+    return text.rstrip() + "\n\n" + ISOLATION_NOTE + "\n"
+
+
 def ensure_tenant_control(chat_id, template, file_send_section=None):
     directory = tenant_control_dir(chat_id)
     persona = directory / "persona.md"
@@ -252,7 +272,11 @@ def stage_tenant_control(chat_id, template, file_send_section=None):
     suffix = ".delegate" if tenant_identity(chat_id)[1] == "delegate" else ""
     for stem, extension in (("persona", "md"), ("mcp", "json")):
         name = f"{stem}.{extension}"
-        atomic_control_write(exchange / f"{stem}{suffix}.{extension}", (directory / name).read_bytes(), 0o644)
+        data = (directory / name).read_bytes()
+        if stem == "persona":
+            # The fixed runtime note is added to the staged copy only, never to the stored persona.
+            data = with_isolation_note(data.decode("utf-8")).encode("utf-8")
+        atomic_control_write(exchange / f"{stem}{suffix}.{extension}", data, 0o644)
     return info
 
 
